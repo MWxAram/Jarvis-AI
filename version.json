@@ -1,9 +1,6 @@
 {
   "version": "0.7.0",
   "files": {
-    ".vscode/settings.json": "8780765f8d50c413f9637915881edb17b9d77949abefd3e46f6fa217ae6ae5f5",
-    "Jarvis/jarvis_dialogs.txt": "54449ea8009708041074b7d832239d6af8d76d25298d089f1ef588f39e6e00a5",
-    "jarvis.ico": "a5b25e831940480d1457faeba22b32cbcfa43c1d6533912d67a53d0206a4b9e9",
     "jarvis_features.py": "989337c8591dbcbbb8cf52758145de242770124ad28ebb89e4321ee08356790c",
     "jarvis_ui.py": "c246a23aaeb0cb7a0de86295da1f26be95346fe6a0fa42536d304dbcf0a9cd99",
     "main_app.py": "55c145473b611c7ba8a52e6125b56ba6ad7f1bb49678d311e68b85c9f239ee70",
