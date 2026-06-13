@@ -1,10 +1,11 @@
 {
-    "version": "0.5.1",
-    "changelog": "Добавлена функция остановки речи голосом (команда 'Стоп') и кнопка на UI. Исправлены вылеты потоков.",
-    "full_update": false,
-    "light_files": [
-        "https://raw.githubusercontent.com/MWxAram/AI-assistant-Jarvis-Soon/main/main_app.py",
-        "https://raw.githubusercontent.com/MWxAram/AI-assistant-Jarvis-Soon/main/jarvis_ui.py"
-    ],
-    "full_update_url": "https://github.com/MWxAram/AI-assistant-Jarvis-Soon/archive/refs/heads/main.zip"
+  "version": "0.8.0",
+  "files": {
+    "main_app.py": "6eff69f5fb4eb69b8f9a4abf3bad85f501973093227e0f1d1ecea337e7bd5a92",
+    "jarvis_ui.py": "05d5e3acfddaeca361c3aab3997ce52577d982ab5c29fc51f827e9f5aa51dd68",
+    "jarvis_features.py": "d4b674a444b47c0f1b91bcd41f74f4f859698467ee4479ccac3d47884c904c70",
+    "updater.py": "41cf14d6de40b79d711a9fe3ce3fb940b64cb7287d70a69f9e229088d8bf6d97"
+  },
+  "updated": "2026-06-13",
+  "changelog": "Initial versioned release with smart file-level updates"
 }
