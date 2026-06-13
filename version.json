@@ -1,11 +1,10 @@
 {
-  "version": "0.8.0",
+  "version": "0.5.0",
   "files": {
-    "main_app.py": "6eff69f5fb4eb69b8f9a4abf3bad85f501973093227e0f1d1ecea337e7bd5a92",
-    "jarvis_ui.py": "05d5e3acfddaeca361c3aab3997ce52577d982ab5c29fc51f827e9f5aa51dd68",
-    "jarvis_features.py": "d4b674a444b47c0f1b91bcd41f74f4f859698467ee4479ccac3d47884c904c70",
-    "updater.py": "41cf14d6de40b79d711a9fe3ce3fb940b64cb7287d70a69f9e229088d8bf6d97"
+    "main_app.py": "eadf945d99d236b763a88a243edc5f0dc0d6a3d2172ef6f47f34b1c400cf7de0",
+    "jarvis_ui.py": "c246a23aaeb0cb7a0de86295da1f26be95346fe6a0fa42536d304dbcf0a9cd99",
+    "jarvis_features.py": "989337c8591dbcbbb8cf52758145de242770124ad28ebb89e4321ee08356790c",
+    "updater.py": "85c90496c96b74de8fa803cb8d662c23275bd8366ba2783e28ae4b6c680ac902"
   },
-  "updated": "2026-06-13",
-  "changelog": "Initial versioned release with smart file-level updates"
+  "updated": "2026-06-13"
 }
