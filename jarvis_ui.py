@@ -2499,7 +2499,7 @@ class JarvisOverlay(QWidget):
         # ── Header ──────────────────────────────────────────────
         hdr = QHBoxLayout(); hdr.setSpacing(4)
 
-        badge = QLabel("0.8")
+        badge = QLabel("0.9") # Версия иентрфейса
         badge.setFont(QFont("Courier New", 8, QFont.Bold))
         badge.setStyleSheet("""
             color: #00ffff; border: 1px solid #00ffff;
