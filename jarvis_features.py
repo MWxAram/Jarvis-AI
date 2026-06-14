@@ -43,9 +43,8 @@ def init(play_voice_fn, get_client_fn, get_model_fn,
     # Запускаем фоновый поток напоминаний (notes reminder)
     threading.Thread(target=_notes_reminder_loop, daemon=True,
                      name="JarvisNotesReminder").start()
-    # Проверка обновлений при старте (тихая, без голоса)
-    threading.Thread(target=lambda: check_updates(silent=True),
-                     daemon=True, name="JarvisUpdateCheck").start()
+    # Проверка обновлений при старте — делается через updater.check_startup()
+    # в main_app.py, чтобы не запускать дважды.
 
 
 _BASE = Path(__file__).parent
