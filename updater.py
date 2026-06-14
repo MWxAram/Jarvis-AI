@@ -30,7 +30,8 @@ _FILE_URL    = (f"https://raw.githubusercontent.com/{GITHUB_USER}/"
 _PROTECTED = {
     "jarvis_config.json", "jarvis_commands.json",
     "jarvis_notes.json",  "jarvis_chat_log.json",
-    "updater.py",   # нельзя обновить себя пока запущен — заменяется лаунчером
+    "updater.py",    # нельзя обновить себя пока запущен — заменяется лаунчером
+    "version.json",  # манифест — перезаписывается локально через _save_version()
 }
 _PROTECTED_DIRS = ("python_env", "venv", ".git", "__pycache__")
 
