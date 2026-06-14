@@ -259,7 +259,12 @@ def check_and_update(silent: bool = False) -> str:
         return msg
 
     try:
-        manifest = json.loads(raw.decode("utf-8"))
+        import re as _re
+        # Убираем trailing commas перед } или ] — JSON их не поддерживает,
+        # но люди часто оставляют при ручном редактировании на GitHub.
+        text = raw.decode("utf-8")
+        text = _re.sub(r",\s*([}\]])", r"\1", text)
+        manifest = json.loads(text)
     except Exception as e:
         msg = f"Сэр, ошибка чтения манифеста обновлений: {e}"
         if not silent: _say(msg)
