@@ -2549,7 +2549,7 @@ updater.init_updater(
     status_fn = jarvis_ui.set_status,
     voice_ru  = VOICE_RUSSIAN,
 )
-updater.check_startup(silent=True)   # тихая проверка через 6 сек после запуска
+updater.check_startup(silent=True)   # silent=True → молчит если актуально, но ВСЕГДА говорит если есть обновление
 
 # Аудио крутится в daemon-потоке
 _audio_thread = threading.Thread(target=_audio_loop, daemon=True, name="JarvisAudio")

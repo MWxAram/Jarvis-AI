@@ -30,8 +30,7 @@ _FILE_URL    = (f"https://raw.githubusercontent.com/{GITHUB_USER}/"
 _PROTECTED = {
     "jarvis_config.json", "jarvis_commands.json",
     "jarvis_notes.json",  "jarvis_chat_log.json",
-    "updater.py",    # нельзя обновить себя пока запущен — заменяется лаунчером
-    "version.json",  # манифест — перезаписывается локально через _save_version()
+    "updater.py",   # нельзя обновить себя пока запущен — заменяется лаунчером
 }
 _PROTECTED_DIRS = ("python_env", "venv", ".git", "__pycache__")
 
@@ -317,12 +316,14 @@ def check_and_update(silent: bool = False) -> str:
 
 
 def check_startup(silent: bool = True):
-    """Тихая проверка при запуске в фоновом потоке.
-    Ждёт 12 сек — чтобы Qt window точно успел инициализироваться,
-    аудио-поток запустился и пользователь услышал приветствие.
+    """Проверка при запуске в фоновом потоке.
+    Ждёт 6 сек — чтобы Qt window инициализировался и пользователь
+    услышал приветствие, прежде чем Джарвис сообщит об обновлении.
+    silent=True  → молчит если всё актуально.
+    silent=False → говорит всегда.
     """
     def _run():
-        time.sleep(12)
+        time.sleep(6)
         check_and_update(silent=silent)
     threading.Thread(target=_run, daemon=True, name="JarvisUpdateStartup").start()
 
