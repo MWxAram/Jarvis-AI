@@ -1,5 +1,5 @@
 """
-JARVIS UI — sci-fi overlay  v0.9
+JARVIS UI — sci-fi overlay  v0.7
 Changes: resize handles, close button, no expand button,
          ring uses setMaximumSize (no overlap), improved settings (lang + API key),
          persistent dialog log, day separators + timestamps in history, fix clear button
@@ -783,7 +783,11 @@ def _append_chat_log(role: str, text: str):
         try:
             if os.path.exists(_CHAT_LOG_FILE):
                 with open(_CHAT_LOG_FILE, "r", encoding="utf-8") as f:
-                    log = json.load(f)
+                    raw = f.read().strip()
+                try:
+                    log = json.loads(raw) if raw else []
+                except Exception:
+                    log = []  # файл повреждён — начинаем заново
                 if not isinstance(log, list):
                     log = []
             else:
@@ -2495,7 +2499,7 @@ class JarvisOverlay(QWidget):
         # ── Header ──────────────────────────────────────────────
         hdr = QHBoxLayout(); hdr.setSpacing(4)
 
-        badge = QLabel("0.9") #Версия в интрфейсе
+        badge = QLabel("0.8")
         badge.setFont(QFont("Courier New", 8, QFont.Bold))
         badge.setStyleSheet("""
             color: #00ffff; border: 1px solid #00ffff;
