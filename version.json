@@ -1,9 +1,10 @@
 {
-  "version": "0.9.3",
+  "version": "1.0.0",
   "files": {
-    "jarvis_features.py": "68c231a189e5a16576505ef88793060d905b7d75d1482938ab492faa9b90964d",
-    "jarvis_ui.py": "f9b0dd03b6fe2f159d647995fb76e47e932be17ba662d1a88a7e852e1d5652a9",
-    "main_app.py": "f94646d26c640590772e76377edc555eda73184993083dcbf5f1df174b0a5dc3"
+    "jarvis_features.py": "54eae6ec3d193211b6b080db5ad5fa293ce6a2433d55aaab86bea4c6f9002d7b",
+    "jarvis_ui.py": "534b3de9134e623fe3b3c216fd89215d265d2774d9719844a831cf2812eb592d",
+    "jarvis_vip.py": "a58358e7f80939a6d138aebadfcdf632ddee8bd043f794ebb5e370092689a89d",
+    "main_app.py": "de14a4be37d97ae95e16c9fae733f77cc2fa817689e23be9184bb51de6561a78"
   },
-  "updated": "2026-06-14 16:49:13"
+  "updated": "2026-06-24 19:56:11"
 }

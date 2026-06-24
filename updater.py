@@ -12,7 +12,7 @@ updater.py — умная система обновлений JARVIS
 """
 
 from __future__ import annotations
-import hashlib, json, os, sys, threading, time, shutil
+import hashlib, json, os, sys, threading, time, shutil, py_compile
 from pathlib import Path
 from typing   import Callable
 
@@ -34,6 +34,17 @@ _PROTECTED = {
     "version.json",  # манифест — перезаписывается локально через _save_version()
 }
 _PROTECTED_DIRS = ("python_env", "venv", ".git", "__pycache__")
+
+# Модули проекта, которые импортируются друг другом во время работы
+# (jarvis_ui импортирует jarvis_vip; main_app импортирует updater,
+# jarvis_features и jarvis_ui). Для них перед принятием скачанного файла
+# делаем py_compile-проверку синтаксиса — битый файл от плохого релиза
+# не должен молча подменить рабочий модуль и заставить, например,
+# jarvis_ui.py откатиться в режим "_vip = None" после перезапуска
+# без внятного объяснения пользователю.
+_CRITICAL_MODULES = {
+    "jarvis_vip.py", "jarvis_features.py", "jarvis_ui.py", "main_app.py",
+}
 
 # Папка проекта (рядом с main_app.py / Run_AI.exe)
 _BASE = Path(sys.argv[0]).parent.resolve()
@@ -123,6 +134,20 @@ def _find_changed(remote_files: dict) -> list[tuple[str, str]]:
     return changed
 
 
+def _is_valid_python(path: Path) -> bool:
+    """Проверяет, что .py-файл синтаксически корректен (py_compile).
+    Используется только для критичных модулей перед тем, как принять
+    скачанную версию — чтобы битый релиз с GitHub не тихо подменил
+    рабочий jarvis_vip.py / jarvis_features.py / jarvis_ui.py / main_app.py.
+    """
+    try:
+        py_compile.compile(str(path), doraise=True)
+        return True
+    except Exception as e:
+        print(f"[UPDATE] синтаксическая ошибка в {path.name}: {e}")
+        return False
+
+
 def _download_file(rel: str, expected_sha: str) -> bool:
     data = _fetch(_FILE_URL.format(path=rel.replace(os.sep, "/")))
     if data is None:
@@ -135,6 +160,14 @@ def _download_file(rel: str, expected_sha: str) -> bool:
     tmp  = dest.with_suffix(dest.suffix + ".tmp")
     try:
         tmp.write_bytes(data)
+        # Критичные .py-модули (импортируются другими модулями в runtime) —
+        # проверяем синтаксис ДО подмены рабочего файла. Если скачанная
+        # версия не компилируется — откатываемся, оставляя старый файл
+        # на месте, и сообщаем об этом явно, а не молча.
+        if rel in _CRITICAL_MODULES and not _is_valid_python(tmp):
+            try: tmp.unlink()
+            except: pass
+            return False
         shutil.move(str(tmp), str(dest))
         print(f"[UPDATE] ✓ {rel}")
         return True
@@ -157,18 +190,47 @@ def _save_version(ver: str, files: dict):
         print(f"[UPDATE] version save error: {e}")
 
 
+def _get_local_files_record() -> dict:
+    """Текущая секция 'files' из локального version.json (если есть)."""
+    try:
+        d = json.loads((_BASE / "version.json").read_text(encoding="utf-8"))
+        return dict(d.get("files", {}))
+    except Exception:
+        return {}
+
+
 # ── Основная логика ───────────────────────────────────────────────────────────
 def _do_download_and_restart(changed: list, remote_ver: str, remote_files: dict):
     """Скачивает изменённые файлы, затем голосом предлагает перезапуск."""
-    ok, fail = 0, []
+    ok, fail, fail_critical = 0, [], []
     for rel, sha in changed:
-        if _download_file(rel, sha): ok += 1
-        else:                        fail.append(rel)
+        if _download_file(rel, sha):
+            ok += 1
+        else:
+            fail.append(rel)
+            if rel in _CRITICAL_MODULES:
+                fail_critical.append(rel)
 
     if ok:
-        _save_version(remote_ver, remote_files)
+        # ВАЖНО: не сохраняем remote_files целиком — только то, что
+        # реально успешно докачано. Иначе при частичном сбое version.json
+        # солжёт, что локальная версия = remote_ver, хотя часть файлов
+        # (например jarvis_vip.py) осталась старой.
+        merged = _get_local_files_record()
+        for rel, _ in changed:
+            if rel not in fail:
+                merged[rel] = remote_files.get(rel, "")
+        # Если обновились вообще все файлы манифеста без исключений —
+        # можно поднять версию целиком; иначе версия остаётся прежней,
+        # чтобы следующая проверка снова попыталась докачать недостающее.
+        new_ver = remote_ver if not fail else _get_local_version()
+        _save_version(new_ver, merged)
 
-    if fail:
+    if fail_critical:
+        msg = (f"Обновлено {ok} из {len(changed)} файлов. "
+               f"Критичные модули не прошли проверку и оставлены прежними: "
+               f"{', '.join(fail_critical)}.")
+    elif fail:
         msg = f"Обновлено {ok} из {len(changed)} файлов. Не удалось: {', '.join(fail)}."
     else:
         msg = f"Обновление завершено, {ok} файлов. Версия {remote_ver}."

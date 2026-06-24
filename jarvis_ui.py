@@ -1,5 +1,5 @@
 """
-JARVIS UI — sci-fi overlay  v0.7
+JARVIS UI — sci-fi overlay  v1.0
 Changes: resize handles, close button, no expand button,
          ring uses setMaximumSize (no overlap), improved settings (lang + API key),
          persistent dialog log, day separators + timestamps in history, fix clear button
@@ -8,6 +8,12 @@ Changes: resize handles, close button, no expand button,
 import sys, math, threading, random, json, os
 import time as _time
 import hashlib, base64, socket
+
+try:
+    import jarvis_vip as _vip
+except Exception as _e:
+    _vip = None
+    print(f"[VIP] jarvis_vip.py не загружен ({_e}) — проверка VIP-кода будет недоступна.")
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
@@ -783,11 +789,7 @@ def _append_chat_log(role: str, text: str):
         try:
             if os.path.exists(_CHAT_LOG_FILE):
                 with open(_CHAT_LOG_FILE, "r", encoding="utf-8") as f:
-                    raw = f.read().strip()
-                try:
-                    log = json.loads(raw) if raw else []
-                except Exception:
-                    log = []  # файл повреждён — начинаем заново
+                    log = json.load(f)
                 if not isinstance(log, list):
                     log = []
             else:
@@ -892,10 +894,13 @@ _TRANSLATIONS = {
         "tab_commands":      "🎮  КОМАНДЫ",
         "tab_custom":        "🎨  КАСТОМИЗАЦИЯ",
         "custom_locked":     "🔒  КАСТОМИЗАЦИЯ",
-        "lbl_access_code":   "Код доступа к кастомизации",
-        "ph_access_code":    "Введите код...",
-        "custom_wrong_code": "Неверный код доступа.",
+        "lbl_access_code":   "VIP-код (кастомизация)",
+        "ph_access_code":    "JRVS-XXXX-XXXX-XXXX",
+        "custom_wrong_code": "Неверный или истёкший VIP-код.",
         "custom_unlocked":   "✅ Кастомизация разблокирована!",
+        "custom_checking":   "⏳ Проверка кода…",
+        "custom_check_unavailable": "Проверка кода недоступна (модуль jarvis_vip не найден).",
+        "custom_revoked":    "🔒 VIP истёк — кастомизация сброшена.",
         "sec_custom_ui":     "🎨  ВНЕШНИЙ ВИД",
         "lbl_accent_color":  "Акцентный цвет",
         "lbl_window_opacity":"Прозрачность окна (%)",
@@ -971,10 +976,13 @@ _TRANSLATIONS = {
         "tab_commands":      "🎮  COMMANDS",
         "tab_custom":        "🎨  CUSTOMIZATION",
         "custom_locked":     "🔒  CUSTOMIZATION",
-        "lbl_access_code":   "Customization access code",
-        "ph_access_code":    "Enter code...",
-        "custom_wrong_code": "Wrong access code.",
+        "lbl_access_code":   "VIP code (customization)",
+        "ph_access_code":    "JRVS-XXXX-XXXX-XXXX",
+        "custom_wrong_code": "Invalid or expired VIP code.",
         "custom_unlocked":   "✅ Customization unlocked!",
+        "custom_checking":   "⏳ Checking code…",
+        "custom_check_unavailable": "Code verification unavailable (jarvis_vip module not found).",
+        "custom_revoked":    "🔒 VIP expired — customization reset.",
         "sec_custom_ui":     "🎨  APPEARANCE",
         "lbl_accent_color":  "Accent color",
         "lbl_window_opacity":"Window opacity (%)",
@@ -1044,10 +1052,13 @@ _TRANSLATIONS = {
         "tab_commands":      "🎮  ՀՐԱՄԱՆՆԵՐ",
         "tab_custom":        "🎨  ՀԱՐՄԱՐԵՑՈՒՄ",
         "custom_locked":     "🔒  ՀԱՐՄԱՐԵՑՈՒՄ",
-        "lbl_access_code":   "Մուտքի կոդ",
-        "ph_access_code":    "Մուտքագրեք կոդ...",
-        "custom_wrong_code": "Սխալ մուտքի կոդ։",
+        "lbl_access_code":   "VIP կոդ (հարմարեցում)",
+        "ph_access_code":    "JRVS-XXXX-XXXX-XXXX",
+        "custom_wrong_code": "Սխալ կամ ժամկետանց VIP կոդ։",
         "custom_unlocked":   "✅ Հարմարեցումը բացված է!",
+        "custom_checking":   "⏳ Կոդի ստուգում…",
+        "custom_check_unavailable": "Կոդի ստուգումը անհասանելի է (jarvis_vip մոդուլը չի գտնվել).",
+        "custom_revoked":    "🔒 VIP-ը լրացել է — հարմարեցումը վերականգնվել է։",
         "sec_custom_ui":     "🎨  ՏԵՍՔ",
         "lbl_accent_color":  "Շեշտի գույն",
         "lbl_window_opacity":"Պատուհանի թափանցիկություն (%)",
@@ -1160,6 +1171,7 @@ class NoScrollComboBox(QComboBox):
 
 class SettingsWindow(ResizableMixin, QWidget):
     sig_saved = pyqtSignal(dict)
+    sig_vip_check_done = pyqtSignal(bool, str, bool, bool)   # valid, message, from_cache, silent
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -1167,8 +1179,11 @@ class SettingsWindow(ResizableMixin, QWidget):
         self.setMinimumSize(320, 260)
         self._resize_init()          # ResizableMixin setup
         self._fields = {}
+        self._vip_check_in_progress = False
         self._build()
         self._load_saved_values()
+        self.sig_vip_check_done.connect(self._on_vip_check_done)
+        self._restore_customization_access()
 
     def _build(self):
         # ── Outer structure ──────────────────────────────────────────
@@ -1660,7 +1675,6 @@ class SettingsWindow(ResizableMixin, QWidget):
         """Kept for compatibility."""
         self._request_recreate()
     # ── CUSTOMIZATION PAGE ────────────────────────────────────────────
-    _CUSTOM_ACCESS_CODE = "1111"
 
     def _build_custom_page(self):
         page = QWidget(); page.setStyleSheet("background: transparent;")
@@ -1804,7 +1818,7 @@ class SettingsWindow(ResizableMixin, QWidget):
             ("#ff3355","Красный"),  ("#cc44ff","Фиолетовый"),("#ff00ff","Пурпурный"),
             ("#ffffff","Белый"),
         ]
-        cfg_sc = _load_config().get("status_colors", {})
+        cfg_sc = _load_config().get("status_colors") or {}
 
         for state_key, state_label, _ in _STATUS_DEFS:
             # label
@@ -1973,7 +1987,7 @@ class SettingsWindow(ResizableMixin, QWidget):
         STATE_RGB[state_key] = (r, g, b)
 
         # Persist
-        cfg_sc = _load_config().get("status_colors", {})
+        cfg_sc = _load_config().get("status_colors") or {}
         cfg_sc[state_key] = [r, g, b]
         _save_config({"status_colors": cfg_sc})
 
@@ -2092,15 +2106,113 @@ class SettingsWindow(ResizableMixin, QWidget):
         except ValueError:
             pass
 
-    def _check_access_code(self) -> bool:
-        if not hasattr(self, "_access_code_field"): return False
-        return self._access_code_field.text().strip() == self._CUSTOM_ACCESS_CODE
+    # ── Проверка VIP-кода через бэкенд (POST /api/vip/verify-code) ──────────
+    # Сетевой запрос выполняется в фоновом потоке, чтобы не подвешивать UI.
+    # Результат приходит обратно через сигнал sig_vip_check_done и
+    # обрабатывается в _on_vip_check_done (уже в UI-потоке).
+    def _check_access_code_async(self, code: str, silent: bool = False):
+        if not code:
+            return
+        if _vip is None:
+            if not silent and hasattr(self, "_access_code_hint"):
+                self._access_code_hint.setStyleSheet(
+                    "color: #ff4455; font-family:'Courier New'; font-size:11px;")
+                self._access_code_hint.setText(_t("custom_check_unavailable"))
+            return
 
-    def _unlock_customization(self):
+        self._vip_check_in_progress = True
+        if not silent and hasattr(self, "_access_code_hint"):
+            self._access_code_hint.setStyleSheet(
+                "color: #7ab8d4; font-family:'Courier New'; font-size:11px;")
+            self._access_code_hint.setText(_t("custom_checking"))
+
+        def _do():
+            cfg = _load_config()
+            result = _vip.verify_code_with_offline_fallback(code, cfg)
+            cache_update = _vip.build_cache_update(code, result)
+            if cache_update:
+                _save_config(cache_update)
+            # Передаём silent через 4-й аргумент сигнала
+            self.sig_vip_check_done.emit(result.valid, result.message,
+                                         result.from_cache, silent)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_vip_check_done(self, valid: bool, message: str,
+                           from_cache: bool, silent: bool = False):
+        self._vip_check_in_progress = False
+        was_unlocked = getattr(self, "_customization_unlocked", False)
+
+        if valid:
+            self._unlock_customization(message, from_cache)
+        else:
+            if was_unlocked:
+                # Код был активен в этой сессии → отзываем и сбрасываем
+                print("[VIP] Код недействителен — сбрасываем кастомизацию и блокируем вкладку.")
+                self._revoke_customization(message)
+            elif not silent:
+                # Интерактивный ввод → показываем ошибку в подсказке
+                if hasattr(self, "_access_code_hint"):
+                    self._access_code_hint.setStyleSheet(
+                        "color: #ff4455; font-family:'Courier New'; font-size:11px;")
+                    self._access_code_hint.setText(message or _t("custom_wrong_code"))
+                print(f"[VIP] Код отклонён: {message}")
+            else:
+                # silent=True + was_unlocked=False: фоновая проверка при старте
+                # показала что VIP истёк, но настройки уже сброшены в _apply_saved_theme
+                # → просто логируем, ничего не делаем в UI
+                print(f"[VIP] Фоновая проверка: код недействителен ({message}) — UI не трогаем.")
+
+    def _unlock_customization(self, hint_message: str = "", from_cache: bool = False):
+        self._customization_unlocked = True
         self._tab3_btn.setEnabled(True); self._tab3_btn.setText(_t("tab_custom"))
-        if hasattr(self, "_access_code_hint"): self._access_code_hint.setText(_t("custom_unlocked"))
-        self._access_code_field.clear()
-        print("[CUSTOM] Вкладка кастомизации разблокирована.")
+        if hasattr(self, "_access_code_hint"):
+            color = "#ffaa00" if from_cache else "#00ff88"
+            self._access_code_hint.setStyleSheet(
+                f"color: {color}; font-family:'Courier New'; font-size:11px;")
+            self._access_code_hint.setText(hint_message or _t("custom_unlocked"))
+        if hasattr(self, "_access_code_field"):
+            self._access_code_field.clear()
+        print(f"[CUSTOM] Вкладка кастомизации разблокирована.{' (офлайн-кэш)' if from_cache else ''}")
+
+    def _revoke_customization(self, reason: str = ""):
+        """Вызывается когда VIP-код стал недействительным (истёк/отозван).
+        Блокирует вкладку кастомизации и сбрасывает все её настройки на дефолт."""
+        self._customization_unlocked = False
+        # Блокируем вкладку
+        self._tab3_btn.setEnabled(False)
+        self._tab3_btn.setText(_t("custom_locked"))
+        # Переключаемся с вкладки кастомизации, если она сейчас активна
+        if hasattr(self, "_stack") and self._stack.currentIndex() == 2:
+            self._switch_tab(0)
+        # Показываем причину блокировки в подсказке
+        if hasattr(self, "_access_code_hint"):
+            self._access_code_hint.setStyleSheet(
+                "color: #ff4455; font-family:'Courier New'; font-size:11px;")
+            self._access_code_hint.setText(
+                reason or _t("custom_wrong_code"))
+        # Очищаем сохранённый код из конфига
+        _save_config({
+            "vip_code": None,
+            "vip_last_valid": False,
+            "vip_last_check_at": None,
+            "vip_last_expires_at": None,
+            "vip_last_plan": None,
+        })
+        # Сбрасываем все настройки кастомизации на заводские
+        self._reset_customization()
+        print(f"[CUSTOM] Кастомизация заблокирована и сброшена по умолчанию. Причина: {reason}")
+
+    def _restore_customization_access(self):
+        """
+        Вызывается при каждом открытии окна настроек: если код уже был
+        сохранён ранее (jarvis_config.json → vip_code), повторно проверяем
+        его через сервер в фоне — без необходимости вводить код заново.
+        """
+        cfg = _load_config()
+        saved_code = cfg.get("vip_code")
+        if saved_code:
+            self._check_access_code_async(saved_code, silent=True)
 
     def _sec(self, txt):
         l = QLabel(txt); l.setStyleSheet(_SEC_SS); return l
@@ -2218,16 +2330,12 @@ class SettingsWindow(ResizableMixin, QWidget):
             else:
                 out[k] = w.text().strip()
 
-        # ── Проверяем код доступа к кастомизации ─────────────────────
+        # ── Проверяем VIP-код доступа к кастомизации (асинхронно) ────
         if hasattr(self, "_access_code_field") and self._access_code_field.text().strip():
-            if self._check_access_code():
-                self._unlock_customization()
-            else:
-                if hasattr(self, "_access_code_hint"):
-                    self._access_code_hint.setStyleSheet(
-                        "color: #ff4455; font-family:'Courier New'; font-size:11px;")
-                    self._access_code_hint.setText(_t("custom_wrong_code"))
-            # Не сохраняем сам код доступа в конфиг
+            self._check_access_code_async(self._access_code_field.text().strip())
+            # Не сохраняем поле ввода кода как обычное настроечное поле —
+            # сам код запишется в конфиг отдельно, внутри _check_access_code_async,
+            # и только если сервер подтвердит, что он действительно валиден.
             out.pop("access_code_field", None)
 
         # ── Шифруем API ключ перед записью на диск ───────────────────
@@ -2257,7 +2365,12 @@ class SettingsWindow(ResizableMixin, QWidget):
             _save_config(out)
 
         self.sig_saved.emit(out)    # apply to overlay immediately
-        self.hide()
+
+        # Если прямо сейчас идёт проверка VIP-кода — не закрываем окно
+        # автоматически, чтобы пользователь увидел результат проверки
+        # (успех/ошибка/нет связи) прежде чем окно скроется.
+        if not self._vip_check_in_progress:
+            self.hide()
 
     # ── Значения по умолчанию для настроек ───────────────────────────────────
     _SETTINGS_DEFAULTS = {
@@ -2499,7 +2612,7 @@ class JarvisOverlay(QWidget):
         # ── Header ──────────────────────────────────────────────
         hdr = QHBoxLayout(); hdr.setSpacing(4)
 
-        badge = QLabel("0.9") # Версия иентрфейса
+        badge = QLabel("1.0") #Версия в интрфейсе
         badge.setFont(QFont("Courier New", 8, QFont.Bold))
         badge.setStyleSheet("""
             color: #00ffff; border: 1px solid #00ffff;
@@ -2912,26 +3025,98 @@ class JarvisOverlay(QWidget):
             SettingsWindow._recreate_pending = False
 
     def _apply_saved_theme(self):
-        """Called on startup — restores opacity, theme and status colors from config."""
+        """Called on startup — restores opacity, theme and status colors from config.
+        Кастомные темы/цвета восстанавливаются ТОЛЬКО если VIP-код сохранён
+        и последняя его проверка была успешной. Если VIP истёк или кода нет —
+        всё остаётся в дефолтном состоянии (даже если в конфиге сохранена тема).
+        """
         global STATE_RGB
-        STATE_RGB = _load_state_rgb_from_cfg()   # restore custom status colours
         cfg = _load_config()
+
+        # ── Проверяем VIP-статус по кэшу (быстро, без сети) ─────────────
+        vip_ok = self._is_vip_valid_from_cache(cfg)
+
+        if not vip_ok:
+            # VIP недействителен — очищаем кастомные поля из конфига
+            # чтобы следующий запуск тоже не пытался их применить
+            _fields_to_clear = {
+                "theme": "default", "theme_bg0": None, "theme_bg1": None,
+                "theme_acc": None,  "theme_acc2": None, "theme_rgb": None,
+                "accent_color": None, "window_opacity": 100,
+                "status_colors": None,
+            }
+            _save_config(_fields_to_clear)
+            STATE_RGB = dict(_DEFAULT_STATE_RGB)
+            print("[CUSTOM] VIP недействителен при старте — тема/цвета сброшены на дефолт.")
+            return
+
+        # ── VIP действителен — восстанавливаем всё сохранённое ───────────
+        STATE_RGB = _load_state_rgb_from_cfg()
+
         # Прозрачность
         pct = cfg.get("window_opacity", 100)
         try:
             _apply_opacity_all(max(40, min(100, int(pct))) / 100.0)
         except Exception:
             pass
+
         # Тема
         if cfg.get("theme_bg0"):
             try:
                 bg0  = cfg["theme_bg0"];  bg1  = cfg["theme_bg1"]
                 acc  = cfg["theme_acc"];   acc2 = cfg["theme_acc2"]
-                rgb  = tuple(cfg.get("theme_rgb", [0,180,255]))
+                rgb  = tuple(cfg.get("theme_rgb", [0, 180, 255]))
                 tid  = cfg.get("theme", "default")
                 self._apply_theme_colors(bg0, bg1, acc, acc2, rgb, theme_id=tid)
             except Exception as e:
                 print(f"[CUSTOM] theme restore error: {e}")
+
+    @staticmethod
+    def _is_vip_valid_from_cache(cfg: dict) -> bool:
+        """
+        Быстрая синхронная проверка VIP по локальному кэшу — без сети.
+        Возвращает True только если:
+          - vip_code сохранён
+          - vip_last_valid == True
+          - vip_last_expires_at не истёк (или None = бессрочно)
+          - vip_last_check_at был не более 3 дней назад (offline grace)
+        """
+        from datetime import datetime, timezone, timedelta
+
+        if not cfg.get("vip_code"):
+            return False
+        if not cfg.get("vip_last_valid"):
+            return False
+
+        # Срок действия кода
+        expires_raw = cfg.get("vip_last_expires_at")
+        if expires_raw:
+            try:
+                from datetime import timezone as _tz
+                dt = datetime.fromisoformat(expires_raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                if dt <= datetime.now(_tz.utc):
+                    return False   # код истёк
+            except Exception:
+                pass
+
+        # Кэш не должен быть старше 3 дней
+        check_raw = cfg.get("vip_last_check_at")
+        if check_raw:
+            try:
+                from datetime import timezone as _tz
+                dt = datetime.fromisoformat(check_raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                if datetime.now(_tz.utc) - dt > timedelta(days=3):
+                    return False   # кэш слишком старый
+            except Exception:
+                pass
+        else:
+            return False   # нет записи о проверке
+
+        return True
 
     def _apply_theme_colors(self, bg0, bg1, acc, acc2, rgb, theme_id=None):
         """Updates overlay ring/scan colors. Full repaint needed."""

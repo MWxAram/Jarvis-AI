@@ -27,11 +27,24 @@ _get_voice_en    = None   # returns str VOICE_JARVIS
 _set_ui_status   = None   # jarvis_ui.set_status(state, text)
 _add_ui_log      = None   # jarvis_ui.add_log(role, text)
 
+# ── Системные действия (переданы из main_app, используются для локального
+#    перехвата без обращения к Gemini) ──────────────────────────────────
+_open_app        = None   # open_app_safe(name)
+_close_app       = None   # close_app_safe(name) → bool
+_open_url        = None   # _open_browser_url(url, name) → dict
+_close_browser   = None   # close_browser_tab(site_name, mode)
+_shutdown        = None   # lambda action: системное действие (shutdown/restart)
+_get_opened_list = None   # lambda: ссылка на список opened_by_jarvis
+
 def init(play_voice_fn, get_client_fn, get_model_fn,
-         get_ru_fn, get_en_fn, set_status_fn, add_log_fn):
+         get_ru_fn, get_en_fn, set_status_fn, add_log_fn,
+         open_app_fn=None, close_app_fn=None,
+         open_url_fn=None, close_browser_fn=None,
+         shutdown_fn=None, opened_list_fn=None):
     """Call once from main_app after imports."""
     global _play_voice, _get_ai_client, _get_model_id
     global _get_voice_ru, _get_voice_en, _set_ui_status, _add_ui_log
+    global _open_app, _close_app, _open_url, _close_browser, _shutdown, _get_opened_list
     _play_voice    = play_voice_fn
     _get_ai_client = get_client_fn
     _get_model_id  = get_model_fn
@@ -39,12 +52,20 @@ def init(play_voice_fn, get_client_fn, get_model_fn,
     _get_voice_en  = get_en_fn
     _set_ui_status = set_status_fn
     _add_ui_log    = add_log_fn
+    # ── Системные действия (локальный перехват без Gemini) ──────────
+    _open_app         = open_app_fn       # open_app_safe(name)
+    _close_app        = close_app_fn      # close_app_safe(name) → bool
+    _open_url         = open_url_fn       # _open_browser_url(url, name) → dict
+    _close_browser    = close_browser_fn  # close_browser_tab(site_name, mode)
+    _shutdown         = shutdown_fn       # lambda action: os.system(...)
+    _get_opened_list  = opened_list_fn    # lambda: opened_by_jarvis list ref
     print("[FEATURES] Модуль расширений инициализирован.")
     # Запускаем фоновый поток напоминаний (notes reminder)
     threading.Thread(target=_notes_reminder_loop, daemon=True,
                      name="JarvisNotesReminder").start()
-    # Проверка обновлений при старте — делается через updater.check_startup()
-    # в main_app.py, чтобы не запускать дважды.
+    # Проверка обновлений при старте (тихая, без голоса)
+    threading.Thread(target=lambda: check_updates(silent=True),
+                     daemon=True, name="JarvisUpdateCheck").start()
 
 
 _BASE = Path(__file__).parent
@@ -684,6 +705,27 @@ _CMD_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'(удали|убери)\s*(последнюю)?\s*(заметку|напоминание)', re.I), "note_delete"),
     # Обновления
     (re.compile(r'(проверь|проверить|есть ли|ищи)\s*(обновление|обновления|update)', re.I), "check_updates"),
+
+    # ── БРАУЗЕР / САЙТЫ (локально, без Gemini) ──────────────────────
+    (re.compile(r'(открой|запусти|включи|зайди|перейди|show|open|launch|play)\s+(youtube|ютуб)', re.I), "open_youtube"),
+    (re.compile(r'(открой|запусти|включи|зайди|перейди|show|open|launch|play)\s+(rutube|рутуб)', re.I), "open_rutube"),
+    (re.compile(r'(найди|погугли|поищи|гугл|google|search for|find|search)\s+(.+)', re.I), "browser_search"),
+    (re.compile(r'(открой|зайди на|открыть|перейди на)\s+(сайт\s+)?([a-zA-Zа-яА-Я0-9\-\.]{3,}\.[a-zA-Z]{2,})', re.I), "open_site"),
+
+    # ── ПРИЛОЖЕНИЯ (локально, без Gemini) ────────────────────────────
+    (re.compile(r'(открой|запусти|включи|открыть|запустить)\s+(?!youtube|ютуб|rutube|рутуб|сайт)([а-яА-Яa-zA-Z0-9][а-яА-Яa-zA-Z0-9 \-]{1,30})', re.I), "open_app_local"),
+    (re.compile(r'(закрой|закрыть|выключи|выключить|останови)\s+(?!всё|все|компьютер|пк|pc)(.+)', re.I), "close_app_local"),
+
+    # ── ВРЕМЯ И ДАТА (локально, без Gemini) ──────────────────────────
+    (re.compile(r'(который|сколько|какое)\s+(час|время|сейчас время|what time)', re.I), "local_time"),
+    (re.compile(r'(what time|what\'s the time|current time)', re.I), "local_time"),
+    (re.compile(r'(какое|какой|which|what)\s*(число|день|date|today)', re.I), "local_date"),
+    (re.compile(r'(какое|какой).{0,15}(число|дата|день)', re.I), "local_date"),
+    (re.compile(r'(сегодня|today)\s*(какое|какой|число|дата|день|date)', re.I), "local_date"),
+
+    # ── ВЫКЛЮЧЕНИЕ / ПЕРЕЗАГРУЗКА (локально, без Gemini) ─────────────
+    (re.compile(r'(выключи|выключить|shutdown|turn off|завершить работу)\s*(компьютер|пк|pc|систему|windows)?', re.I), "sys_shutdown"),
+    (re.compile(r'(перезагрузи|перезагрузить|restart|reboot)\s*(компьютер|пк|pc|систему)?', re.I), "sys_restart"),
 ]
 
 
@@ -839,9 +881,137 @@ def try_handle(text: str) -> dict | None:
         elif cmd_id == "note_delete":
             return {"content": delete_last_note(), "voice": voice_ru}
 
-        # ── ОБНОВЛЕНИЯ ──────────────────────────────────────────────
         elif cmd_id == "check_updates":
             result = check_updates(silent=False)
             return {"content": result, "voice": voice_ru}
+
+        # ── БРАУЗЕР / САЙТЫ ─────────────────────────────────────────
+        elif cmd_id == "open_youtube":
+            # Ищем запрос для поиска после ключевых слов
+            q_m = re.search(r'(?:youtube|ютуб)[,\s]+(.+)', text, re.I)
+            query = q_m.group(1).strip() if q_m else ""
+            link = (f"https://www.youtube.com/results?search_query={query}"
+                    if query else "https://www.youtube.com")
+            name = f"youtube {query}".strip()
+            if _open_url:
+                entry = _open_url(link, name)
+                if _get_opened_list is not None:
+                    _get_opened_list().append(entry)
+            else:
+                import webbrowser; webbrowser.open(link)
+            reply = f"Открываю YouTube{f', ищу «{query}»' if query else ''}, сэр."
+            return {"content": reply, "voice": voice_ru}
+
+        elif cmd_id == "open_rutube":
+            q_m = re.search(r'(?:rutube|рутуб)[,\s]+(.+)', text, re.I)
+            query = q_m.group(1).strip() if q_m else ""
+            link = (f"https://rutube.ru/search/?query={query}"
+                    if query else "https://rutube.ru")
+            name = f"rutube {query}".strip()
+            if _open_url:
+                entry = _open_url(link, name)
+                if _get_opened_list is not None:
+                    _get_opened_list().append(entry)
+            else:
+                import webbrowser; webbrowser.open(link)
+            reply = f"Открываю Rutube{', ищу «{query}»' if query else ''}, сэр."
+            return {"content": reply, "voice": voice_ru}
+
+        elif cmd_id == "browser_search":
+            m2 = re.search(r'(?:найди|погугли|поищи|гугл|google|search for|find|search)\s+(.+)', text, re.I)
+            query = m2.group(1).strip() if m2 else text
+            link = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+            name = f"google {query}"
+            if _open_url:
+                entry = _open_url(link, name)
+                if _get_opened_list is not None:
+                    _get_opened_list().append(entry)
+            else:
+                import webbrowser; webbrowser.open(link)
+            return {"content": f"Ищу «{query}» в Google, сэр.", "voice": voice_ru}
+
+        elif cmd_id == "open_site":
+            m2 = re.search(
+                r'(?:открой|зайди на|открыть|перейди на)\s+(?:сайт\s+)?([a-zA-Zа-яА-Я0-9\-\.]{3,}\.[a-zA-Z]{2,})',
+                text, re.I)
+            if not m2:
+                continue
+            domain = m2.group(1).strip().lower()
+            url = domain if domain.startswith("http") else f"https://{domain}"
+            name = domain.split(".")[0]
+            if _open_url:
+                entry = _open_url(url, name)
+                if _get_opened_list is not None:
+                    _get_opened_list().append(entry)
+            else:
+                import webbrowser; webbrowser.open(url)
+            return {"content": f"Открываю {domain}, сэр.", "voice": voice_ru}
+
+        # ── ПРИЛОЖЕНИЯ ───────────────────────────────────────────────
+        elif cmd_id == "open_app_local":
+            m2 = re.search(
+                r'(?:открой|запусти|включи|открыть|запустить)\s+(?!youtube|ютуб|rutube|рутуб|сайт)(.+)',
+                text, re.I)
+            if not m2:
+                continue
+            app_name = m2.group(1).strip()
+            if _open_app:
+                if _play_voice:
+                    _play_voice("Выполняю", voice_ru)
+                _open_app(app_name)
+                if _get_opened_list is not None:
+                    _get_opened_list().append({"type": "app", "name": app_name})
+            return {"content": f"Открываю {app_name}, сэр.", "voice": voice_ru}
+
+        elif cmd_id == "close_app_local":
+            m2 = re.search(
+                r'(?:закрой|закрыть|выключи|выключить|останови)\s+(.+)', text, re.I)
+            if not m2:
+                continue
+            target = m2.group(1).strip()
+            closed = False
+            if _close_app:
+                closed = _close_app(target)
+            if not closed and _close_browser:
+                _close_browser(site_name=target, mode="smart")
+            reply = f"Закрываю {target}, сэр." if (closed or _close_browser) else f"Не нашёл процесс «{target}», сэр."
+            return {"content": reply, "voice": voice_ru}
+
+        # ── ВРЕМЯ И ДАТА ─────────────────────────────────────────────
+        elif cmd_id == "local_time":
+            now = datetime.datetime.now()
+            time_str = now.strftime("%H:%M")
+            hour = now.hour
+            if 5 <= hour < 12:   greeting = "Доброе утро, сэр."
+            elif 12 <= hour < 17: greeting = "Добрый день, сэр."
+            elif 17 <= hour < 22: greeting = "Добрый вечер, сэр."
+            else:                  greeting = "Доброй ночи, сэр."
+            return {"content": f"Сейчас {time_str}. {greeting}", "voice": voice_ru}
+
+        elif cmd_id == "local_date":
+            now = datetime.datetime.now()
+            MONTHS_RU = [
+                "", "января", "февраля", "марта", "апреля", "мая", "июня",
+                "июля", "августа", "сентября", "октября", "ноября", "декабря"
+            ]
+            DAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+            day_name = DAYS_RU[now.weekday()]
+            date_str = f"{now.day} {MONTHS_RU[now.month]} {now.year} года, {day_name}"
+            return {"content": f"Сегодня {date_str}, сэр.", "voice": voice_ru}
+
+        # ── ВЫКЛЮЧЕНИЕ / ПЕРЕЗАГРУЗКА ────────────────────────────────
+        elif cmd_id == "sys_shutdown":
+            if _shutdown:
+                _shutdown("shutdown")
+            else:
+                import os; os.system("shutdown /s /t 3")
+            return {"content": "Выключаю компьютер, сэр. До свидания.", "voice": voice_ru}
+
+        elif cmd_id == "sys_restart":
+            if _shutdown:
+                _shutdown("restart")
+            else:
+                import os; os.system("shutdown /r /t 3")
+            return {"content": "Перезагружаю компьютер, сэр.", "voice": voice_ru}
 
     return None   # не наша команда — пусть main_app отправит в Gemini

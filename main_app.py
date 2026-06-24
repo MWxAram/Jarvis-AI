@@ -4,27 +4,56 @@ import json
 import wave
 import threading
 import asyncio
-import numpy as np
-import sounddevice as sd
-import speech_recognition as sr
-import openwakeword
-import webbrowser
-from google import genai
 import re
 import warnings
 import getpass
-from datetime import datetime
-import pytz
-import psutil
-import subprocess
-import win32gui
-import win32process
-import win32con
-import soundfile as sf
 import time
 import winreg
 import ctypes
+import webbrowser
+import subprocess
 from ctypes import wintypes
+from datetime import datetime
+
+import numpy as np
+import pytz
+
+# ── Тяжёлые импорты — загружаются немедленно (нужны в callback) ──────────────
+import sounddevice as sd
+import speech_recognition as sr
+import win32gui
+import win32process
+import win32con
+import psutil
+
+# ── Импорты которые можно отложить на ~0.5с — грузим в фоне ─────────────────
+# (edge_tts, gtts, AppOpener, soundfile, pygame, openwakeword)
+# Загрузка в фоне позволяет UI появиться быстрее.
+_heavy_loaded = threading.Event()   # взводится когда всё готово
+
+def _load_heavy_imports():
+    global pygame, gTTS, edge_tts, open_app, sf, openwakeword
+    import pygame as _pg
+    from gtts import gTTS as _gtts
+    import edge_tts as _edge_tts
+    from AppOpener import open as _open_app
+    import soundfile as _sf
+    import openwakeword as _oww
+    pygame = _pg
+    gTTS = _gtts
+    edge_tts = _edge_tts
+    open_app = _open_app
+    sf = _sf
+    openwakeword = _oww
+    _heavy_loaded.set()
+
+# Запускаем фоновую загрузку сразу — к моменту первой команды всё будет готово
+threading.Thread(target=_load_heavy_imports, daemon=True, name="HeavyImports").start()
+
+from google import genai
+import jarvis_ui
+import jarvis_features as jf
+import updater
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 warnings.filterwarnings("ignore")
@@ -47,10 +76,6 @@ def _run_async(coro):
     finally:
         loop.close()
 
-import pygame
-from gtts import gTTS
-import edge_tts
-from AppOpener import open as open_app
 import jarvis_ui
 import jarvis_features as jf
 import updater
@@ -1822,13 +1847,13 @@ def process_logic(text):
 
 # --- ВОСПРОИЗВЕДЕНИЕ ---
 
-# ✅ ОПТИМИЗАЦИЯ: инициализируем mixer ОДИН РАЗ при старте
-pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
-pygame.mixer.init()
-
 
 async def play_voice_async(text, voice_name, force_virtual=False, silent=False):
     if not text: return
+
+    # Ждём пока pygame/edge_tts загружены (обычно уже готово к первому вызову)
+    if not _heavy_loaded.is_set():
+        await asyncio.get_event_loop().run_in_executor(None, _heavy_loaded.wait)
 
     _tts_stop.clear()
     is_speaking.set()
@@ -2364,6 +2389,10 @@ def callback(indata, frames, time_info, status):
     global conversation_mode, LAST_ACTIVITY, realtime_translation_mode, translator_mode
     global _listening_printed, _say_and_listen_active, _ww_cooldown_until
 
+    # Модель ещё не загружена (фоновый поток) — пропускаем
+    if ww_model is None:
+        return
+
     # Пока Джарвис говорит — не слушаем микрофон (кроме реалтайм-перевода).
     # Остановка осуществляется кнопкой в интерфейсе.
     if is_speaking.is_set() and not realtime_translation_mode:
@@ -2498,10 +2527,28 @@ def callback(indata, frames, time_info, status):
             print("\n>>> ЖДУ КОМАНДУ HEY JARVIS...")
             _listening_printed = True
 
-# --- СТАРТ ---
-ww_model = openwakeword.Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-print(f"\n>>> JARVIS SYSTEM v0.5 ONLINE | MODEL: {MODEL_ID}")
-print(">>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
+# ── СТАРТ ───────────────────────────────────────────────────────────────────
+# ww_model грузится в фоне — самая долгая операция (~2-4с на onnx).
+# До готовности модели callback() просто пропускает аудио (ww_model is None).
+ww_model = None
+_ww_model_ready = threading.Event()
+
+def _load_ww_model():
+    global ww_model
+    _heavy_loaded.wait()   # ждём пока openwakeword импортирован
+    ww_model = openwakeword.Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+    _ww_model_ready.set()
+    print(">>> JARVIS ГОТОВ | Жду команду 'HEY JARVIS'...")
+
+threading.Thread(target=_load_ww_model, daemon=True, name="LoadWakeWord").start()
+
+# Pygame mixer — инициализируем в фоне после загрузки heavy imports
+def _init_pygame():
+    _heavy_loaded.wait()
+    pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
+    pygame.mixer.init()
+
+threading.Thread(target=_init_pygame, daemon=True, name="InitPygame").start()
 
 def _audio_loop():
     """Аудио-поток: запускается в фоне, чтобы Qt event loop остался в главном потоке."""
@@ -2530,6 +2577,7 @@ jarvis_ui.register_settings_callback(_on_settings_saved)
 jarvis_ui.register_stop_tts_callback(stop_tts)
 jarvis_ui.start_ui()
 jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
+print(f"\n>>> JARVIS SYSTEM v0.5 ONLINE | MODEL: {MODEL_ID}")
 
 # Инициализируем модуль расширений (таймеры, буфер, скриншоты, громкость, заметки, обновления)
 jf.init(
@@ -2540,6 +2588,16 @@ jf.init(
     get_en_fn      = lambda: VOICE_JARVIS,
     set_status_fn  = jarvis_ui.set_status,
     add_log_fn     = jarvis_ui.add_log,
+    # ── Локальные команды без Gemini ──────────────────────────────
+    open_app_fn    = open_app_safe,
+    close_app_fn   = close_app_safe,
+    open_url_fn    = _open_browser_url,
+    close_browser_fn = close_browser_tab,
+    shutdown_fn    = lambda action: (
+        os.system("shutdown /s /t 3") if action == "shutdown"
+        else os.system("shutdown /r /t 3")
+    ),
+    opened_list_fn = lambda: opened_by_jarvis,
 )
 
 # ── Система обновлений ────────────────────────────────────────────────────────
@@ -2549,7 +2607,7 @@ updater.init_updater(
     status_fn = jarvis_ui.set_status,
     voice_ru  = VOICE_RUSSIAN,
 )
-updater.check_startup(silent=True)   # silent=True → молчит если актуально, но ВСЕГДА говорит если есть обновление
+updater.check_startup(silent=True)   # тихая проверка через 6 сек после запуска
 
 # Аудио крутится в daemon-потоке
 _audio_thread = threading.Thread(target=_audio_loop, daemon=True, name="JarvisAudio")
