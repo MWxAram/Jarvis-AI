@@ -2399,7 +2399,10 @@ def callback(indata, frames, time_info, status):
         return
 
     vol = np.linalg.norm(indata) * 10
-    if vol < 3:
+    # FIX: был порог vol < 3 — при тихом микрофоне silence_counter
+    # никогда не рос и программа зависала в режиме "Говорите".
+    # Убираем ранний выход: пустые фреймы нужны для счётчика тишины.
+    if vol < 0.5:   # только абсолютная тишина (отключённый mic)
         return
 
     # === РЕЖИМ РЕАЛТАЙМ-ПЕРЕВОДА: всегда пишем, без wake word ===
@@ -2426,10 +2429,17 @@ def callback(indata, frames, time_info, status):
         if len(ww_audio) >= CHUNK:
             ww_model.predict(ww_audio)
 
-            # custom wake word: keep using hey_jarvis model score but lower threshold
-            _cww = jarvis_ui.get_custom_wake_word()
+            # FIX: Порог wake word теперь адаптируется к уровню микрофона.
+            # При тихом микрофоне модель даёт меньший скор — снижаем порог.
+            # _low_vol_mode = True если последние 3 сек mic был тихим (< 5)
             _score = ww_model.prediction_buffer["hey_jarvis"][-1]
-            _ww_fired = _score > (0.4 if _cww else 0.6)
+            _cww = jarvis_ui.get_custom_wake_word()
+            # Адаптивный порог: если vol низкий — порог ниже
+            if vol < 5:
+                _threshold = 0.3 if _cww else 0.45
+            else:
+                _threshold = 0.4 if _cww else 0.6
+            _ww_fired = _score > _threshold
 
             if _ww_fired:
                 # ✅ FIX: Сбрасываем буфер предсказаний сразу после детекции,
