@@ -1240,7 +1240,8 @@ class SettingsWindow(ResizableMixin, QWidget):
         self._tab1_btn = QPushButton(_t("tab_settings"))
         self._tab2_btn = QPushButton(_t("tab_commands"))
         self._tab3_btn = QPushButton(_t("custom_locked"))   # locked by default
-        for b in (self._tab1_btn, self._tab2_btn, self._tab3_btn):
+        self._tab4_btn = QPushButton("👤  Об авторе")
+        for b in (self._tab1_btn, self._tab2_btn, self._tab3_btn, self._tab4_btn):
             b.setCheckable(True)
             b.setStyleSheet(TAB_SS)
         self._tab3_btn.setEnabled(False)   # locked until correct code entered
@@ -1248,9 +1249,11 @@ class SettingsWindow(ResizableMixin, QWidget):
         self._tab1_btn.clicked.connect(lambda: (_sfx("tab"), self._switch_tab(0)))
         self._tab2_btn.clicked.connect(lambda: (_sfx("tab"), self._switch_tab(1)))
         self._tab3_btn.clicked.connect(lambda: (_sfx("tab"), self._switch_tab(2)))
+        self._tab4_btn.clicked.connect(lambda: (_sfx("tab"), self._switch_tab(3)))
         tab_bar.addWidget(self._tab1_btn)
         tab_bar.addWidget(self._tab2_btn)
         tab_bar.addWidget(self._tab3_btn)
+        tab_bar.addWidget(self._tab4_btn)
         tab_bar.addStretch()
         tab_widget = QWidget()
         tab_widget.setLayout(tab_bar)
@@ -1269,12 +1272,15 @@ class SettingsWindow(ResizableMixin, QWidget):
         self._stack.addWidget(self._build_commands_page())
         # PAGE 2 — Customization (locked)
         self._stack.addWidget(self._build_custom_page())
+        # PAGE 3 — About author
+        self._stack.addWidget(self._build_about_page())
 
     def _switch_tab(self, idx):
         self._stack.setCurrentIndex(idx)
         self._tab1_btn.setChecked(idx == 0)
         self._tab2_btn.setChecked(idx == 1)
         self._tab3_btn.setChecked(idx == 2)
+        self._tab4_btn.setChecked(idx == 3)
 
     def _build_settings_page(self):
         page = QWidget(); page.setStyleSheet("background: transparent;")
@@ -1959,6 +1965,134 @@ class SettingsWindow(ResizableMixin, QWidget):
         bd_c.clicked.connect(self._reset_customization)
         br_c.addWidget(bd_c)
         root.addLayout(br_c)
+
+        root.addStretch()
+        return page
+
+    # ── About page ────────────────────────────────────────────────────────────
+
+    def _build_about_page(self):
+        """Вкладка 'Об авторе' — показывает аватарку GitHub, ник и ссылку."""
+        import urllib.request
+
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(20, 24, 20, 20)
+        root.setSpacing(14)
+
+        # ── Заголовок ────────────────────────────────────────────────
+        title = QLabel("👤  РАЗРАБОТЧИК")
+        title.setStyleSheet("""
+            color: #00d4ff; font-family: 'Courier New';
+            font-size: 13px; font-weight: bold; letter-spacing: 2px;
+        """)
+        title.setAlignment(Qt.AlignCenter)
+        root.addWidget(title)
+
+        # ── Аватарка GitHub ──────────────────────────────────────────
+        avatar_label = QLabel()
+        avatar_label.setAlignment(Qt.AlignCenter)
+        avatar_label.setFixedSize(90, 90)
+        avatar_label.setStyleSheet("""
+            border: 2px solid rgba(0, 212, 255, 120);
+            border-radius: 45px;
+            background: rgba(0,20,50,180);
+        """)
+        root.addWidget(avatar_label, alignment=Qt.AlignCenter)
+
+        def _load_avatar():
+            try:
+                url = "https://avatars.githubusercontent.com/MWxAram?s=200"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = resp.read()
+                pix = QPixmap()
+                pix.loadFromData(data)
+                # Круглая маска
+                pix = pix.scaled(86, 86, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                rounded = QPixmap(86, 86)
+                rounded.fill(Qt.transparent)
+                painter = QPainter(rounded)
+                painter.setRenderHint(QPainter.Antialiasing)
+                path = QPainterPath()
+                path.addEllipse(QRectF(0, 0, 86, 86))
+                painter.setClipPath(path)
+                painter.drawPixmap(0, 0, pix)
+                painter.end()
+                avatar_label.setPixmap(rounded)
+            except Exception as e:
+                print(f"[ABOUT] Avatar load error: {e}")
+                avatar_label.setText("👤")
+                avatar_label.setStyleSheet("""
+                    color: #00d4ff; font-size: 36px;
+                    border: 2px solid rgba(0,212,255,120);
+                    border-radius: 45px;
+                    background: rgba(0,20,50,180);
+                """)
+
+        threading.Thread(target=_load_avatar, daemon=True).start()
+
+        # ── Ник ──────────────────────────────────────────────────────
+        nick = QLabel("MWxAram")
+        nick.setAlignment(Qt.AlignCenter)
+        nick.setStyleSheet("""
+            color: #ffffff; font-family: 'Courier New';
+            font-size: 18px; font-weight: bold; letter-spacing: 1px;
+        """)
+        root.addWidget(nick)
+
+        # ── Подпись ──────────────────────────────────────────────────
+        role = QLabel("Создатель JARVIS AI Assistant")
+        role.setAlignment(Qt.AlignCenter)
+        role.setStyleSheet("""
+            color: rgba(0,212,255,160); font-family: 'Courier New';
+            font-size: 11px; letter-spacing: 1px;
+        """)
+        root.addWidget(role)
+
+        # ── Разделитель ───────────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet("color: rgba(0,180,255,40);")
+        root.addWidget(div)
+
+        # ── Кнопка GitHub ────────────────────────────────────────────
+        gh_btn = QPushButton("⬡  GitHub: MWxAram")
+        gh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        gh_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(0,180,255,25);
+                border: 1px solid rgba(0,212,255,100);
+                border-radius: 6px;
+                color: #00d4ff;
+                font-family: 'Courier New';
+                font-size: 12px;
+                font-weight: bold;
+                padding: 10px 20px;
+                letter-spacing: 1px;
+            }
+            QPushButton:hover {
+                background: rgba(0,212,255,60);
+                border-color: #00d4ff;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background: rgba(0,212,255,90);
+            }
+        """)
+        import webbrowser as _wb
+        gh_btn.clicked.connect(lambda: (_sfx("click"), _wb.open("https://github.com/MWxAram")))
+        root.addWidget(gh_btn)
+
+        # ── Копирайт ─────────────────────────────────────────────────
+        copy_lbl = QLabel("© 2025  MWxAram  —  All rights reserved")
+        copy_lbl.setAlignment(Qt.AlignCenter)
+        copy_lbl.setStyleSheet("""
+            color: rgba(255,255,255,50); font-family: 'Courier New';
+            font-size: 10px; letter-spacing: 1px;
+        """)
+        root.addWidget(copy_lbl)
 
         root.addStretch()
         return page
