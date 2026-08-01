@@ -15,6 +15,12 @@ except Exception as _e:
     _vip = None
     print(f"[VIP] jarvis_vip.py не загружен ({_e}) — проверка VIP-кода будет недоступна.")
 
+try:
+    import jarvis_analytics as _analytics
+except Exception as _e:
+    _analytics = None
+    print(f"[ANALYTICS] jarvis_analytics.py не загружен ({_e}) — сбор статистики недоступен.")
+
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QCheckBox, QScrollArea, QFrame, QComboBox,
@@ -1609,7 +1615,7 @@ class SettingsWindow(ResizableMixin, QWidget):
             path_v = path_w.text().strip()
             if not path_v: continue
             try: delay_v = int(delay_w.text().strip() or "0")
-            except: delay_v = 0
+            except Exception: delay_v = 0
             actions.append({"path": path_v, "delay_ms": delay_v})
 
         new_cmd = {"id": cid, "name": name_f.text().strip(),
@@ -2344,7 +2350,7 @@ class SettingsWindow(ResizableMixin, QWidget):
         его через сервер в фоне — без необходимости вводить код заново.
         """
         cfg = _load_config()
-        saved_code = cfg.get("vip_code")
+        saved_code = _vip.get_stored_code(cfg) if _vip else cfg.get("vip_code")
         if saved_code:
             self._check_access_code_async(saved_code, silent=True)
 
@@ -3069,6 +3075,8 @@ class JarvisOverlay(QWidget):
         if self._history_win.isVisible():
             self._history_win.hide()
             return
+        if _analytics:
+            _analytics.track("history_opened")
         g = self.geometry()
         hw = self._history_win
         x = g.right() + 8
@@ -3084,6 +3092,18 @@ class JarvisOverlay(QWidget):
         if hasattr(self, "_tray"):
             self._tray.hide()
         _save_session_txt()   # ← сохраняем переписку в .txt на Рабочий стол
+        # ── Статистика: перед выключением пробуем отправить всю очередь
+        # накопленных событий (текущей сессии + всё, что не ушло раньше).
+        # Блокирующий вызов с коротким таймаутом — это последний момент,
+        # когда мы можем попытаться, дальше процесс завершается. Если не
+        # получилось (нет сети/сервер лежит) — очередь остаётся на диске
+        # и будет снова отправлена при следующем запуске/выключении.
+        if _analytics:
+            try:
+                _analytics.track("app_close")
+                _analytics.flush()
+            except Exception as _e:
+                print(f"[ANALYTICS] Ошибка при отправке статистики перед выходом: {_e}")
         import os as _os
         _os._exit(0)
 
@@ -3096,6 +3116,8 @@ class JarvisOverlay(QWidget):
     def _open_settings(self):
         if self._settings.isVisible():
             self._settings.hide(); return
+        if _analytics:
+            _analytics.track("settings_opened")
         g  = self.geometry()
         sw = self._settings
         x  = g.left() - sw.width() - 6

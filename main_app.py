@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import json
 import wave
@@ -14,6 +15,79 @@ import webbrowser
 import subprocess
 from ctypes import wintypes
 from datetime import datetime
+
+# ── Зеркалирование консоли в logs.txt ────────────────────────────────────────
+# Всё, что раньше уходило только в окно консоли (обычные print() по всей
+# программе, а также трейсбеки необработанных исключений и ошибок в потоках,
+# как например RuntimeError из PyQt-потоков) — теперь дублируется в файл
+# logs.txt рядом с программой. Сделано через подмену sys.stdout/sys.stderr,
+# а не через logging-модуль, чтобы не переписывать сотни существующих print()
+# по всему проекту.
+if getattr(sys, "frozen", False):
+    _LOG_DIR = os.path.dirname(sys.executable)
+else:
+    _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_PATH = os.path.join(_LOG_DIR, "logs.txt")
+
+
+class _TeeStream:
+    """Пишет одновременно в оригинальный поток консоли (если есть) и в файл."""
+
+    def __init__(self, original, log_file):
+        self._original = original  # может быть None (например, pythonw/--noconsole сборка)
+        self._log_file = log_file
+
+    def write(self, data):
+        if self._original is not None:
+            try:
+                self._original.write(data)
+            except Exception:
+                pass
+        try:
+            self._log_file.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        if self._original is not None:
+            try: self._original.flush()
+            except Exception: pass
+        try: self._log_file.flush()
+        except Exception: pass
+
+    def isatty(self):
+        return False
+
+
+def _init_console_logging():
+    try:
+        # Простая ротация: чтобы logs.txt не рос бесконечно за месяцы работы,
+        # если файл раздулся больше 5 МБ — переносим в logs.txt.old (одна
+        # предыдущая копия) и начинаем новый.
+        if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 5 * 1024 * 1024:
+            old_path = os.path.join(_LOG_DIR, "logs.txt.old")
+            try:
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+                os.replace(_LOG_PATH, old_path)
+            except Exception as e:
+                # Не критично для запуска, но стоит знать, почему ротация
+                # не сработала (например, файл занят другим процессом) —
+                # иначе logs.txt будет расти бесконечно без объяснений.
+                print(f"[!] Не удалось выполнить ротацию logs.txt: {e}")
+
+        log_file = open(_LOG_PATH, "a", encoding="utf-8", errors="replace", buffering=1)
+        log_file.write(f"\n{'='*70}\n[СЕССИЯ] Запуск {datetime.now().isoformat(sep=' ', timespec='seconds')}\n{'='*70}\n")
+        log_file.flush()
+        sys.stdout = _TeeStream(sys.stdout, log_file)
+        sys.stderr = _TeeStream(sys.stderr, log_file)
+    except Exception as e:
+        # Если логирование в файл не завелось — программа всё равно должна
+        # нормально работать, просто без сохранения в logs.txt.
+        print(f"[!] Не удалось инициализировать logs.txt: {e}")
+
+
+_init_console_logging()
 
 import numpy as np
 import pytz
@@ -54,6 +128,11 @@ from google import genai
 import jarvis_ui
 import jarvis_features as jf
 import updater
+try:
+    import jarvis_analytics as analytics
+except Exception as _e:
+    analytics = None
+    print(f"[ANALYTICS] jarvis_analytics.py не загружен ({_e}) - сбор статистики недоступен.")
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 warnings.filterwarnings("ignore")
@@ -61,7 +140,7 @@ warnings.filterwarnings("ignore")
 import ctypes
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("mycompany.jarvis.system.v07")
-except:
+except Exception:
     pass
 
 def _run_async(coro):
@@ -75,10 +154,6 @@ def _run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
-
-import jarvis_ui
-import jarvis_features as jf
-import updater
 
 # ── Hot-reload all settings without restart ────────────────────────────────
 # Called automatically by jarvis_ui every time the user saves settings.
@@ -122,14 +197,37 @@ def _on_settings_saved(cfg: dict):
 
 # --- КОНФИГУРАЦИЯ ---
 
-def _load_jarvis_config():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
-    if os.path.exists(path):
+_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
+_cfg_lock = threading.Lock()   # защищает чтение/запись jarvis_config.json от гонок между потоками
+
+# ✅ ОПТИМИЗАЦИЯ: кэш конфига по mtime файла. Раньше _load_jarvis_config()
+# перечитывала и парсила jarvis_config.json с диска на КАЖДЫЙ вызов
+# _get_client(), то есть на каждый запрос к Gemini — лишний disk I/O +
+# JSON-parsing на каждый диалоговый ход. Теперь читаем заново только если
+# файл реально изменился (например, после сохранения настроек в UI).
+_cfg_cache = {}
+_cfg_cache_mtime = None
+
+def _load_jarvis_config(force: bool = False):
+    """
+    Возвращает конфиг из jarvis_config.json с кэшированием по mtime.
+    force=True — игнорировать кэш (используется сразу после записи файла).
+    """
+    global _cfg_cache, _cfg_cache_mtime
+    with _cfg_lock:
         try:
-            return json.load(open(path, encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+            mtime = os.path.getmtime(_CFG_PATH)
+        except OSError:
+            return {}
+        if not force and _cfg_cache_mtime == mtime:
+            return _cfg_cache
+        try:
+            with open(_CFG_PATH, encoding="utf-8") as f:
+                _cfg_cache = json.load(f)
+            _cfg_cache_mtime = mtime
+        except Exception as e:
+            print(f"[CFG][WARN] Не удалось прочитать jarvis_config.json: {e}")
+        return _cfg_cache
 
 _CFG = _load_jarvis_config()
 
@@ -146,7 +244,7 @@ def _get_client():
       3. GEMINI_API_KEY (переменная окружения)
     """
     global _genai_client
-    _live_cfg = _load_jarvis_config()
+    _live_cfg = _load_jarvis_config()   # быстрый кэш-хит, если файл не менялся
 
     # 1. Encrypted key (приоритет)
     api_key = ""
@@ -166,13 +264,17 @@ def _get_client():
             try:
                 new_enc = jarvis_ui._encrypt_key(plain)
                 if new_enc:
-                    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_config.json")
-                    with open(cfg_path, "r", encoding="utf-8") as _f:
-                        _cfg_data = json.load(_f)
-                    _cfg_data["api_key_enc"] = new_enc
-                    _cfg_data.pop("api_key", None)   # убираем plain
-                    with open(cfg_path, "w", encoding="utf-8") as _f:
-                        json.dump(_cfg_data, _f, ensure_ascii=False, indent=2)
+                    # ✅ FIX: чтение+запись конфига теперь под _cfg_lock — раньше
+                    # два потока могли одновременно прочитать/переписать файл и
+                    # затереть изменения друг друга (гонка при записи).
+                    with _cfg_lock:
+                        with open(_CFG_PATH, "r", encoding="utf-8") as _f:
+                            _cfg_data = json.load(_f)
+                        _cfg_data["api_key_enc"] = new_enc
+                        _cfg_data.pop("api_key", None)   # убираем plain
+                        with open(_CFG_PATH, "w", encoding="utf-8") as _f:
+                            json.dump(_cfg_data, _f, ensure_ascii=False, indent=2)
+                    _load_jarvis_config(force=True)  # обновляем кэш сразу, не ждём следующего mtime-чека
                     print("[AI] API ключ автоматически зашифрован и plain-версия удалена.")
             except Exception as _e:
                 print(f"[AI][WARN] Не удалось зашифровать ключ при миграции: {_e}")
@@ -209,8 +311,11 @@ def _load_custom_data():
     if os.path.exists(_COMMANDS_FILE):
         try:
             return json.load(open(_COMMANDS_FILE, encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as e:
+            # Раньше это молча возвращало пустые defaults — пользователь мог
+            # потерять свой custom_wake_word/команды из-за битого JSON и даже
+            # не узнать об этом. Теперь хотя бы видно в логе.
+            print(f"[!] jarvis_commands.json повреждён или не читается ({e}) — использую значения по умолчанию.")
     return {"custom_wake_word": None, "commands": []}
 
 def _exec_custom_command(cmd):
@@ -264,7 +369,9 @@ silence_counter = 0
 
 _jarvis_lock = threading.Lock()   # защита opened_by_jarvis
 _last_opened = None  # {'type': 'browser'|'app'|'folder', 'name': str, 'target': str}
-_pending_catalog_save = None  # текст каталога, ждём согласия пользователя на сохранение .txt
+# Подтверждение "сохранить каталог команд в .txt?" теперь регистрируется через
+# updater.set_pending_confirm() — общий стек да/нет-ожиданий (см. updater.py),
+# чтобы не конфликтовать с подтверждением обновления/перезапуска.
 
 VIRTUAL_CABLE_NAME = "CABLE Input"
 
@@ -287,8 +394,57 @@ conversation_history = []
 opened_by_jarvis = []
 MAX_HISTORY = int(_CFG.get("max_history", 20))
 
+# ✅ FIX: раньше SYSTEM_PROMPT вообще не содержал номер версии — Джарвис
+# на вопрос "какая у тебя версия" галлюцинировал случайное число (видели
+# в логах "1.0", "1.0.0"), хотя реальная версия лежит в version.json и
+# updater.py её прекрасно знает. Читаем её один раз при старте и жёстко
+# прописываем в промпт, чтобы модели было неоткуда взять другое число.
+JARVIS_VERSION = updater._get_local_version()
+
+# ── Учёт использованных токенов ─────────────────────────────────────────
+# У Gemini API нет публичного эндпоинта "сколько квоты осталось" — Google
+# отдаёт это только через веб-интерфейс AI Studio, не через API-ключ (см.
+# https://ai.google.dev — квоты видны только в дашборде). Поэтому вместо
+# несуществующего "остатка" считаем то, что реально можем знать: сколько
+# токенов потрачено — из usage_metadata каждого ответа Gemini.
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_usage.json")
+_usage_lock = threading.Lock()
+
+def _load_token_usage() -> dict:
+    try:
+        with open(_USAGE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"date": "", "today_tokens": 0, "total_tokens": 0, "total_requests": 0}
+
+def _record_token_usage(response):
+    """Вызывать после каждого успешного generate_content(). Тихо не делает
+    ничего, если у ответа нет usage_metadata (другая версия SDK и т.п.)."""
+    try:
+        meta = getattr(response, "usage_metadata", None)
+        total = getattr(meta, "total_token_count", None) if meta else None
+        if total is None:
+            return
+        today = datetime.now(pytz.timezone("Asia/Yerevan")).strftime("%Y-%m-%d")
+        with _usage_lock:
+            data = _load_token_usage()
+            if data.get("date") != today:
+                data["date"] = today
+                data["today_tokens"] = 0
+            data["today_tokens"] = data.get("today_tokens", 0) + total
+            data["total_tokens"] = data.get("total_tokens", 0) + total
+            data["total_requests"] = data.get("total_requests", 0) + 1
+            with open(_USAGE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[USAGE][WARN] Не удалось записать статистику токенов: {e}")
+
 SYSTEM_PROMPT = f"""
 You are Jarvis. User: {USER_NAME}. Location: Armenia.
+Your exact current version is {JARVIS_VERSION} — this is the ONLY correct
+answer if asked about your version. NEVER invent or guess a different
+version number, and never say you don't know it — you always know it,
+it's {JARVIS_VERSION}.
 
 STRICT RULE: ALWAYS respond in the SAME language as the user. NEVER switch to English.
 If user speaks Russian → respond in Russian only. No English words at all.
@@ -320,6 +476,24 @@ Rules:
    - [RT_TRANSLATOR_ON:язык] — включить реалтайм перевод (вывод в виртуальный кабель). ТОЛЬКО если пользователь явно сказал "реальное время", "реалтайм", "в кабель", "для стрима".
 9. Site map: ВК/VK→[URL:https://vk.com], YouTube/Ютуб→[URL:https://youtube.com], Google/Гугл→[URL:https://google.com]
 10. Style: concise, polite, use user's name if known, match user's language exactly.
+11. Below the rules you'll see a "Текущий статус Джарвиса/ПК" block with REAL live
+    data (volume, VIP status, whether the Gemini API key is set, version, model,
+    tokens used). If asked about yourself/the PC (your volume, VIP, API key,
+    version, tokens, etc.) — answer ONLY using that block. Never guess or invent
+    a different value, never say you don't know — you always have this data.
+    If asked how many tokens are LEFT/remaining — be honest: Google's API gives
+    no way to check the remaining free-tier quota programmatically, only the
+    amount USED (which you do know, from the block). Tell the user how much was
+    used and mention the exact remaining quota is only visible in Google AI Studio.
+12. When your answer covers a concrete real-world topic that naturally has a web
+    page (news, a wiki article, a game/product update, a place, an event, etc.) —
+    after answering, ASK in your own words whether to open a page about it. Do
+    NOT include [URL:...]/[SEARCH:...] in that same message — just ask, e.g.
+    "Хотите, я открою страницу об этом?". Only if the user confirms in a LATER
+    message (да, открой, давай, конечно, ...) — THEN, using the session history
+    above to recall what was discussed, respond with the actual [URL:...] or
+    [SEARCH:...] tag to open it. Don't offer this for trivial answers (math,
+    time, simple facts) — only when a page would genuinely add value.
 """
 
 TRANSLATOR_LANGS = {
@@ -656,6 +830,70 @@ def restore_mic():
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
+def get_live_status_context():
+    """
+    Живой статус самого Джарвиса/ПК на момент запроса — чтобы модель
+    отвечала на вопросы о себе ("какая у тебя громкость", "активирован
+    ли VIP", "есть ли у тебя ключ ИИ") реальными данными, а не гадала
+    (как раньше было с версией — см. фикс JARVIS_VERSION).
+    Читаем по живым данным на каждый запрос, а не кэшируем — громкость и
+    VIP-статус могут поменяться между запросами.
+    """
+    cfg = _load_jarvis_config()
+
+    # Громкость системы (0-100%, либо "не удалось определить")
+    try:
+        vol = jf._get_master_volume()
+        vol_str = f"{round(vol * 100)}%" if vol is not None else "не удалось определить"
+    except Exception:
+        vol_str = "не удалось определить"
+
+    # VIP: по последней успешной/неуспешной проверке (см. jarvis_vip.py)
+    vip_valid = bool(cfg.get("vip_last_valid"))
+    if vip_valid:
+        vip_plan = cfg.get("vip_last_plan") or "неизвестный план"
+        vip_expires = cfg.get("vip_last_expires_at")
+        if vip_expires:
+            try:
+                _exp_dt = datetime.fromisoformat(vip_expires.replace("Z", "+00:00"))
+                vip_expires_str = _exp_dt.strftime("%d.%m.%Y")
+            except Exception:
+                vip_expires_str = vip_expires
+            vip_str = f"активирован ({vip_plan}), истекает {vip_expires_str}"
+        else:
+            vip_str = f"активирован ({vip_plan}), бессрочно / дата окончания неизвестна"
+    else:
+        vip_str = "не активирован"
+
+    # Наличие ключа Gemini (сам ключ никогда не раскрываем модели)
+    has_key = bool((cfg.get("api_key_enc") or "").strip() or (cfg.get("api_key") or "").strip())
+    key_str = "указан" if has_key else "НЕ указан — функции ИИ не будут работать"
+
+    # Токены: у Gemini API нет способа узнать ОСТАТОК квоты через API-ключ
+    # (это видно только в вебе, AI Studio) — считаем то, что реально можем
+    # знать: сколько потрачено, из usage_metadata каждого ответа.
+    _usage = _load_token_usage()
+    usage_str = (
+        f"использовано сегодня — {_usage.get('today_tokens', 0)}, "
+        f"всего за всё время — {_usage.get('total_tokens', 0)} "
+        f"({_usage.get('total_requests', 0)} запросов). "
+        "Точный ОСТАТОК бесплатной квоты Google не отдаёт через API — "
+        "только в вебе, в Google AI Studio."
+    )
+
+    return (
+        "--- Текущий статус Джарвиса/ПК (реальные данные, отвечай ТОЛЬКО ими, "
+        "никогда не выдумывай другие значения) ---\n"
+        f"Версия: {JARVIS_VERSION}\n"
+        f"Громкость системы: {vol_str}\n"
+        f"VIP-кастомизация: {vip_str}\n"
+        f"API-ключ Gemini: {key_str}\n"
+        f"Модель ИИ: {MODEL_ID}\n"
+        f"Токены (потрачено, НЕ остаток — см. пояснение): {usage_str}\n"
+        "---\n"
+    )
+
+
 def get_session_context():
     if not conversation_history:
         return ""
@@ -746,7 +984,7 @@ def find_app_exe(app_name):
                                 if any(w in f_lower for w in words):
                                     return f, os.path.join(root, f)
                         break  # только верхний уровень папки
-        except:
+        except Exception:
             continue
 
     # Поиск в реестре (uninstall keys)
@@ -766,9 +1004,9 @@ def find_app_exe(app_name):
                         path, _ = winreg.QueryValueEx(sub, "")
                         if path and os.path.exists(path):
                             return sub_name, path
-                    except:
+                    except Exception:
                         pass
-        except:
+        except Exception:
             continue
 
     return None, None
@@ -793,7 +1031,7 @@ def open_app_safe(app_name):
             try:
                 subprocess.Popen(exe, shell=True)
                 return True
-            except:
+            except Exception:
                 pass
 
     # Прямые известные пути для популярных приложений
@@ -893,14 +1131,14 @@ def open_app_safe(app_name):
             subprocess.Popen([full_path])
             print(f"[✓] Запущено через поиск: {full_path}")
             return True
-        except:
+        except Exception:
             pass
 
     # AppOpener как последний вариант
     try:
         open_app(app_name, match_closest=True, throw_error=True)
         return True
-    except:
+    except Exception:
         pass
 
     print(f"[!] Не удалось найти приложение: {app_name}")
@@ -1049,6 +1287,23 @@ def _open_browser_url(url: str, name: str) -> dict:
 
 def _close_tab_cdp(search_term: str | None, mode: str) -> bool:
     """Закрывает вкладки через CDP (точный метод)."""
+    # ── Чистим "мёртвые" записи ──────────────────────────────────────────
+    # Если пользователь вручную закрыл вкладку, которую раньше открыл
+    # Jarvis (просто крестиком в браузере), запись об этой вкладке
+    # оставалась в opened_by_jarvis навсегда — Jarvis об этом не узнавал.
+    # Из-за этого "smart"-режим мог намертво зависнуть на одной такой
+    # записи (см. ниже) и список постепенно копил мусор. Сверяем со
+    # списком РЕАЛЬНО живых вкладок (без фильтра по search_term, чтобы
+    # не спутать "не подошло под поиск" с "вкладки больше не существует")
+    # и вычищаем всё, чего там больше нет.
+    all_live_ids = {t["id"] for t in _cdp_list_tabs()}
+    with _jarvis_lock:
+        for entry in list(opened_by_jarvis):
+            if (entry.get("type") == "browser" and entry.get("tab_id")
+                    and entry["tab_id"] not in all_live_ids):
+                try: opened_by_jarvis.remove(entry)
+                except Exception: pass
+
     with _jarvis_lock:
         jarvis_tabs = [
             item for item in opened_by_jarvis
@@ -1062,31 +1317,35 @@ def _close_tab_cdp(search_term: str | None, mode: str) -> bool:
     live_tabs = _cdp_list_tabs(search_term)
 
     if mode == "smart":
-        # Приоритет: вкладка открытая Jarvis'ом → закрываем по сохранённому tab_id
-        if jarvis_tabs:
-            entry = jarvis_tabs[-1]
+        # Приоритет: вкладка открытая Jarvis'ом → закрываем по сохранённому tab_id.
+        # Пробуем от самой недавней записи к самой старой — после чистки
+        # выше все они должны быть живыми, но на случай гонки (вкладку
+        # закрыли между чисткой и этим моментом) не сдаёмся на первой же
+        # неудаче, а пробуем следующую.
+        for entry in reversed(jarvis_tabs):
             ok = _cdp_close_tab(entry["tab_id"])
+            with _jarvis_lock:
+                try: opened_by_jarvis.remove(entry)
+                except Exception: pass
             if ok:
-                with _jarvis_lock:
-                    try: opened_by_jarvis.remove(entry)
-                    except: pass
-            return ok
-        # Нет записи → ищем по title/url среди живых вкладок
+                return True
+        # Нет (живой) записи → ищем по title/url среди живых вкладок
         if live_tabs:
             return _cdp_close_tab(live_tabs[-1]["id"])
         return False
 
     elif mode == "all":
         if not live_tabs: return False
-        n = sum(1 for t in live_tabs if _cdp_close_tab(t["id"]))
+        closed_ids = {t["id"] for t in live_tabs if _cdp_close_tab(t["id"])}
+        n = len(closed_ids)
         with _jarvis_lock:
             for entry in list(opened_by_jarvis):
-                if entry.get("type") == "browser" and (
-                    not search_term
-                    or search_term in entry.get("name", "").lower()
-                ):
+                # Убираем из bookkeeping только те записи, чьи вкладки
+                # реально были закрыты только что (по id), а не все, что
+                # просто совпали по имени.
+                if entry.get("type") == "browser" and entry.get("tab_id") in closed_ids:
                     try: opened_by_jarvis.remove(entry)
-                    except: pass
+                    except Exception: pass
         print(f"[CDP] Закрыто вкладок: {n}")
         return n > 0
 
@@ -1096,9 +1355,12 @@ def _close_tab_cdp(search_term: str | None, mode: str) -> bool:
         for entry in list(jarvis_tabs):
             if _cdp_close_tab(entry["tab_id"]):
                 n += 1
-                with _jarvis_lock:
-                    try: opened_by_jarvis.remove(entry)
-                    except: pass
+            # Удаляем запись в любом случае: либо успешно закрыли, либо
+            # она уже была мёртвой (не смысла хранить дальше) — реальные
+            # ошибки сети здесь маловероятны, т.к. CDP только что отвечал.
+            with _jarvis_lock:
+                try: opened_by_jarvis.remove(entry)
+                except Exception: pass
         return n > 0
 
     elif mode == "all_user":
@@ -1188,11 +1450,23 @@ def _close_tab_winapi(search_term: str | None, mode: str) -> bool:
     if mode == "smart":
         windows = get_matching_windows()
         if windows:
-            ok = bring_and_close(windows[-1])
+            hwnd = windows[-1]
+            # Запоминаем заголовок ДО закрытия — по нему сверяем, какую
+            # именно запись из opened_by_jarvis это было (если вообще было).
+            title_before = win32gui.GetWindowText(hwnd).lower()
+            ok = bring_and_close(hwnd)
             if ok and jarvis_tabs:
-                with _jarvis_lock:
-                    try: opened_by_jarvis.remove(jarvis_tabs[-1])
-                    except: pass
+                # Раньше здесь вслепую удаляли jarvis_tabs[-1], даже если
+                # закрытое окно на самом деле не имело к нему отношения —
+                # учёт "что ещё открыл Jarvis" мог разойтись с реальностью.
+                # Теперь удаляем только ту запись, чьё имя действительно
+                # входит в заголовок закрытого окна.
+                match = next((t for t in jarvis_tabs
+                              if t.get("name", "").lower() in title_before), None)
+                if match:
+                    with _jarvis_lock:
+                        try: opened_by_jarvis.remove(match)
+                        except Exception: pass
             return ok
         if search_term:
             all_wins = []
@@ -1201,9 +1475,9 @@ def _close_tab_winapi(search_term: str | None, mode: str) -> bool:
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     if any(b in psutil.Process(pid).name().lower()
-                           for b in ['chrome','firefox','msedge','opera','brave']):
+                           for b in _BROWSER_EXE):
                         all_wins.append(hwnd)
-                except: pass
+                except Exception: pass
             win32gui.EnumWindows(_ea, None)
             if all_wins: return bring_and_close(all_wins[-1])
         return False
@@ -1218,7 +1492,7 @@ def _close_tab_winapi(search_term: str | None, mode: str) -> bool:
         with _jarvis_lock:
             for tab in list(jarvis_tabs):
                 try: opened_by_jarvis.remove(tab)
-                except: pass
+                except Exception: pass
         return closed > 0
 
     elif mode == "all_jarvis":
@@ -1229,7 +1503,7 @@ def _close_tab_winapi(search_term: str | None, mode: str) -> bool:
                 n += 1
                 with _jarvis_lock:
                     try: opened_by_jarvis.remove(_)
-                    except: pass
+                    except Exception: pass
         return n > 0
 
     elif mode == "all_user":
@@ -1350,7 +1624,7 @@ def close_app_safe(app_name):
     for key, exes in app_exe_map.items():
         if key in name_lower:
             for exe in exes:
-                r = subprocess.run(f"taskkill /f /im {exe}", shell=True,
+                r = subprocess.run(["taskkill", "/f", "/im", exe],
                                    capture_output=True, text=True)
                 print(f"[DEBUG] taskkill {exe}: rc={r.returncode} err={r.stderr.strip()[:60]}")
                 if r.returncode == 0:
@@ -1376,11 +1650,11 @@ def close_app_safe(app_name):
                     if score > best_score:
                         best_score = score
                         best_match = proc_name
-        except:
+        except Exception:
             continue
 
     if best_match and best_score >= 3:
-        r = subprocess.run(f"taskkill /f /im {best_match}", shell=True,
+        r = subprocess.run(["taskkill", "/f", "/im", best_match],
                            capture_output=True, text=True)
         print(f"[DEBUG] taskkill {best_match}: rc={r.returncode}")
         if r.returncode == 0:
@@ -1393,14 +1667,14 @@ def close_app_safe(app_name):
     for _p in psutil.process_iter(['name']):
         try:
             _all_procs.append(_p.info['name'])
-        except: pass
+        except Exception: pass
     _all_clean = [_n.lower().replace(".exe","") for _n in _all_procs]
     # Ищем наиболее похожее имя (порог 0.55 — достаточно чтобы "проекты" нашло "projects")
     _matches = _dl.get_close_matches(name_lower, _all_clean, n=1, cutoff=0.55)
     if _matches:
         _idx = _all_clean.index(_matches[0])
         _best_exe = _all_procs[_idx]
-        r = subprocess.run(f"taskkill /f /im {_best_exe}", shell=True,
+        r = subprocess.run(["taskkill", "/f", "/im", _best_exe],
                            capture_output=True, text=True)
         print(f"[FUZZY] taskkill {_best_exe} (похоже на '{name_lower}'): rc={r.returncode}")
         if r.returncode == 0:
@@ -1432,6 +1706,7 @@ def process_translator(text):
                 config={'candidate_count': 1}
             )
             if response and response.text:
+                _record_token_usage(response)
                 translated = response.text.strip()
                 print(f"[Перевод → {translator_target_lang}]: {translated}")
                 return {"content": translated, "voice": translator_voice}
@@ -1489,7 +1764,7 @@ def try_calc_math(text):
         if isinstance(result, float) and result.is_integer():
             result = int(result)
         return str(result)
-    except:
+    except Exception:
         return None
 
 
@@ -1595,9 +1870,56 @@ def _handle_catalog_request(original_text: str) -> dict:
     jarvis_ui.add_log("jarvis", catalog)
     conversation_history.append({"role": "jarvis", "text": catalog})
 
-    # Флаг: следующий ответ пользователя — проверяем согласие на сохранение .txt
-    global _pending_catalog_save
-    _pending_catalog_save = catalog
+    # Регистрируем ожидание да/нет через общий стек updater'а (см. updater.py) —
+    # раньше это был отдельный флаг _pending_catalog_save, который мог
+    # конфликтовать с подтверждением обновления, если оба вопроса оказывались
+    # активны одновременно.
+    def _on_save_agreed():
+        global recording, conversation_mode
+        try:
+            _desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            _txt_path = os.path.join(_desktop, "jarvis_help.txt")
+            with open(_txt_path, "w", encoding="utf-8") as _f:
+                _f.write(catalog)
+            _save_msg = "Готово, сэр. Файл jarvis_help.txt сохранён на рабочем столе."
+            print(f"[Jarvis]: {_save_msg}")
+        except Exception as _e:
+            _save_msg = f"Сэр, не удалось сохранить файл: {_e}"
+            print(f"[!] catalog save error: {_e}")
+        jarvis_ui.add_log("jarvis", _save_msg)
+        _speak(_save_msg, VOICE_RUSSIAN)
+        recording = False
+        conversation_mode = False
+        jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
+        print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
+
+    def _on_save_declined():
+        global recording, conversation_mode
+        _no_msg = "Хорошо, сэр. Если понадоблюсь — я здесь."
+        jarvis_ui.add_log("jarvis", _no_msg)
+        _speak(_no_msg, VOICE_RUSSIAN)
+        recording = False
+        conversation_mode = False
+        jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
+        print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
+
+    def _on_save_ignored():
+        # Пользователь не ответил "да"/"нет", а сказал что-то другое —
+        # молча снимаем вопрос, БЕЗ голосового "хорошо, я здесь" и без
+        # сброса recording/conversation_mode: его фраза сейчас пойдёт в
+        # обычную обработку ниже и сама решит, что делать с этими флагами.
+        print("[CATALOG] Вопрос о сохранении проигнорирован — пользователь сменил тему.")
+
+    updater.set_pending_confirm(
+        on_yes=_on_save_agreed,
+        on_no=_on_save_declined,
+        on_ignore=_on_save_ignored,
+        keywords_yes={"да", "конечно", "сохрани", "сохраняй", "сохрани пожалуйста",
+                      "yes", "sure", "save", "please save", "ok", "ок", "окей",
+                      "хочу", "хорошо", "давай"},
+        keywords_no={"нет", "не надо", "не нужно", "отмена", "отменить",
+                     "no", "don't", "cancel", "skip", "пропусти"},
+    )
     return {"content": catalog, "voice": voice}
 
 
@@ -1615,6 +1937,7 @@ def process_logic(text):
 
         conversation_history.append({"role": "user", "text": text})
         session_ctx = get_session_context()
+        live_status_ctx = get_live_status_context()
 
         # --- Локальный перехват: запрос каталога возможностей ---
         # Обрабатываем локально чтобы ИИ не выполнял теги из своего же ответа
@@ -1674,7 +1997,7 @@ def process_logic(text):
                     return {"content": "Сэр, API-ключ не задан. Укажите ключ Gemini в настройках.", "voice": VOICE_RUSSIAN}
                 response = client.models.generate_content(
                     model=MODEL_ID,
-                    contents=f"{SYSTEM_PROMPT}\n{time_context}\n{lang_instruction}\n{session_ctx}\nUser: {user_msg}"
+                    contents=f"{SYSTEM_PROMPT}\n{time_context}\n{lang_instruction}\n{live_status_ctx}\n{session_ctx}\nUser: {user_msg}"
                 )
                 break
             except Exception as e:
@@ -1686,6 +2009,7 @@ def process_logic(text):
         if not response or not response.text:
             return {"content": "Сэр, ответ пуст.", "voice": VOICE_RUSSIAN}
 
+        _record_token_usage(response)
         answer = response.text.replace("*", "").strip()
         clean_print = RE_PATTERNS['clean_tags'].sub('', answer).strip()
         print(f"[Jarvis]: {clean_print}")
@@ -1847,6 +2171,86 @@ def process_logic(text):
 
 # --- ВОСПРОИЗВЕДЕНИЕ ---
 
+# Если текст длиннее этого — озвучиваем его по кускам (по границам
+# предложений), чтобы не ждать синтеза ВСЕГО текста перед первым звуком.
+_SPEECH_CHUNK_THRESHOLD = 256
+# Целевой размер одного куска при склейке соседних предложений. Меньше —
+# первый звук раньше, но больше отдельных запросов к edge_tts; больше —
+# наоборот. 200 символов — разумный компромисс.
+_SPEECH_CHUNK_TARGET_LEN = 200
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+|\n+')
+# ✅ FIX: раньше сплитили ТОЛЬКО по .!?… — списки с буллетами ("• Открыть
+# YouTube\n") без точек в конце строки вообще не разбивались и уезжали
+# ОДНИМ куском в несколько тысяч символов (например, каталог возможностей),
+# то есть chunking фактически не работал именно там, где он нужнее всего.
+# Теперь дополнительно разбиваем по переносам строк.
+
+# Предохранитель на случай сплошного текста без единого разделителя (ни
+# точек, ни переносов строк) — принудительно режем по словам, чтобы
+# гарантированно не получить один гигантский кусок.
+_HARD_CHUNK_MAX = 400
+
+
+def _split_into_speech_chunks(text: str, target_len: int = _SPEECH_CHUNK_TARGET_LEN) -> list:
+    """
+    Разбивает длинный текст на куски по границам предложений/строк (точка,
+    !?…, перенос строки), а не по количеству символов "в лоб" — иначе можно
+    обрезать посреди слова. Соседние короткие куски склеиваются примерно до
+    target_len символов, чтобы не дробить речь слишком мелко.
+    """
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    if not sentences:
+        return [text]
+
+    # Если даже один "кусок" после разбиения всё ещё длиннее _HARD_CHUNK_MAX
+    # (сплошной текст без точек и переносов) — рубим его по словам.
+    safe_sentences = []
+    for s in sentences:
+        if len(s) <= _HARD_CHUNK_MAX:
+            safe_sentences.append(s)
+            continue
+        words = s.split(' ')
+        piece = ""
+        for w in words:
+            candidate = f"{piece} {w}".strip() if piece else w
+            if len(candidate) > _HARD_CHUNK_MAX and piece:
+                safe_sentences.append(piece)
+                piece = w
+            else:
+                piece = candidate
+        if piece:
+            safe_sentences.append(piece)
+    sentences = safe_sentences
+
+    chunks = []
+    current = ""
+    for s in sentences:
+        candidate = f"{current} {s}".strip() if current else s
+        if len(candidate) > target_len and current:
+            chunks.append(current)
+            current = s
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _synthesize_speech_chunk(text_chunk: str, voice_name: str) -> io.BytesIO:
+    """Синтезирует один кусок текста в mp3 (edge_tts, либо gTTS для армянского)."""
+    buf = io.BytesIO()
+    if voice_name == "hy":
+        tts = gTTS(text_chunk, lang="hy")
+        tts.write_to_fp(buf)
+    else:
+        communicate = edge_tts.Communicate(text_chunk, voice_name, rate=VOICE_RATE, pitch=VOICE_PITCH)
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+    buf.seek(0)
+    return buf
+
 
 async def play_voice_async(text, voice_name, force_virtual=False, silent=False):
     if not text: return
@@ -1868,6 +2272,36 @@ async def play_voice_async(text, voice_name, force_virtual=False, silent=False):
         return False
 
     try:
+        # ── Длинный текст, обычное (не виртуальное) воспроизведение ──────
+        # Синтезируем и проигрываем по кускам-предложениям, "внахлёст":
+        # пока звучит кусок N, кусок N+1 уже синтезируется в фоне — это
+        # убирает и долгое ожидание перед стартом речи (не нужно ждать
+        # синтеза всего текста), и паузы между кусками (следующий уже
+        # готов к моменту, когда доиграл предыдущий).
+        # ✅ FIX: раньше армянский (voice_name == "hy") исключался из чанкинга
+        # и длинный текст на gTTS всегда синтезировался одним куском целиком —
+        # заметная пауза перед стартом речи. _synthesize_speech_chunk() уже
+        # умеет синтезировать "hy"-куски через gTTS, так что ограничение было
+        # лишним — оставляем только реальное условие (виртуальный кабель не
+        # поддерживает потоковую подмену буфера на лету).
+        if not force_virtual and len(text) > _SPEECH_CHUNK_THRESHOLD:
+            chunks = _split_into_speech_chunks(text)
+            next_task = asyncio.create_task(_synthesize_speech_chunk(chunks[0], voice_name))
+            for i in range(len(chunks)):
+                buf = await next_task
+                if i + 1 < len(chunks):
+                    next_task = asyncio.create_task(
+                        _synthesize_speech_chunk(chunks[i + 1], voice_name))
+                pygame.mixer.music.load(buf, "mp3")
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    if _interrupted():
+                        if i + 1 < len(chunks):
+                            next_task.cancel()
+                        return
+                    await asyncio.sleep(0.05)
+            return
+
         # Армянский голос: gTTS (edge_tts не поддерживает "hy")
         if voice_name == "hy":
             tts = gTTS(text, lang="hy")
@@ -1921,8 +2355,11 @@ async def play_voice_async(text, voice_name, force_virtual=False, silent=False):
             while pygame.mixer.music.get_busy():
                 if _interrupted(): break
                 await asyncio.sleep(0.05)
-        except Exception:
-            pass
+        except Exception as e:
+            # И основной синтез, и запасной звук "Ошибка" не сработали —
+            # пользователь останется вообще без звука и без объяснений.
+            # Раньше это глоталось молча.
+            print(f"[!] TTS fallback тоже не сработал: {e}")
     finally:
         _tts_stop.clear()
         is_speaking.clear()
@@ -1936,6 +2373,14 @@ def _speak(text, voice):
     Озвучивает ответ Джарвиса.
     Сбрасывает буфер предсказаний перед воспроизведением,
     чтобы исключить ложные триггеры от предыдущей команды.
+
+    ВАЖНО: эта функция НЕ логирует текст (не print, не add_log, не
+    conversation_history) — раньше здесь было такое логирование, но
+    process_logic() уже логирует свой ответ ДО возврата, и получалось
+    задвоение (см. лог: каждая фраза печаталась дважды). Логировать нужно
+    один раз, в точке, где ответ впервые формируется — см. вызов
+    jf.try_handle() в background_worker, где логирования раньше не было
+    вообще (это и было настоящей дырой).
     """
     for _k in ww_model.prediction_buffer:
         _b = ww_model.prediction_buffer[_k]
@@ -1948,7 +2393,7 @@ def _speak(text, voice):
 def background_worker(audio_data_copy):
     global translator_mode, translator_target_lang, translator_voice
     global realtime_translation_mode, recording, conversation_mode, _last_opened
-    global _pending_catalog_save
+    global conversation_history
 
     is_processing.set()  # блокируем wake word пока обрабатываем
     try:
@@ -1965,7 +2410,7 @@ def background_worker(audio_data_copy):
             audio_recorded = r_global.record(source)
             try:
                 user_text = r_global.recognize_google(audio_recorded, language="ru-RU")
-            except:
+            except Exception:
                 # STT не распознал ничего — возвращаемся в режим ожидания
                 jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
                 print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
@@ -1985,55 +2430,17 @@ def background_worker(audio_data_copy):
                 jarvis_ui.add_log("user", user_text)
                 jarvis_ui.set_status("processing", user_text[:60])
 
-                # --- ОЖИДАНИЕ ОТВЕТА НА СОХРАНЕНИЕ КАТАЛОГА В .TXT ---
-                global _pending_catalog_save
-                if _pending_catalog_save is not None:
-                    _t_low_ans = user_text.lower()
-                    _YES_WORDS = [
-                        "да", "конечно", "сохрани", "сохраняй", "сохрани пожалуйста",
-                        "yes", "sure", "save", "please save", "ok", "ок", "окей",
-                        "хочу", "хорошо", "давай",
-                    ]
-                    _NO_WORDS = [
-                        "нет", "не надо", "не нужно", "отмена", "отменить",
-                        "no", "don't", "cancel", "skip", "пропусти",
-                    ]
-                    _save_agreed = any(w in _t_low_ans for w in _YES_WORDS)
-                    _save_denied = any(w in _t_low_ans for w in _NO_WORDS)
-
-                    if _save_agreed:
-                        _catalog_text = _pending_catalog_save
-                        _pending_catalog_save = None
-                        try:
-                            _desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                            _txt_path = os.path.join(_desktop, "jarvis_help.txt")
-                            with open(_txt_path, "w", encoding="utf-8") as _f:
-                                _f.write(_catalog_text)
-                            _save_msg = f"Готово, сэр. Файл jarvis_help.txt сохранён на рабочем столе."
-                            print(f"[Jarvis]: {_save_msg}")
-                        except Exception as _e:
-                            _save_msg = f"Сэр, не удалось сохранить файл: {_e}"
-                            print(f"[!] catalog save error: {_e}")
-                        jarvis_ui.add_log("jarvis", _save_msg)
-                        _speak(_save_msg, VOICE_RUSSIAN)
-                        recording = False
-                        conversation_mode = False
-                        jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
-                        print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
-                        return
-                    elif _save_denied:
-                        _pending_catalog_save = None
-                        _no_msg = "Хорошо, сэр. Если понадоблюсь — я здесь."
-                        jarvis_ui.add_log("jarvis", _no_msg)
-                        _speak(_no_msg, VOICE_RUSSIAN)
-                        recording = False
-                        conversation_mode = False
-                        jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
-                        print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
-                        return
-                    else:
-                        # Ответ не понят — сбрасываем ожидание и обрабатываем как обычную команду
-                        _pending_catalog_save = None
+                # --- ОБЩЕЕ ОЖИДАНИЕ ДА/НЕТ (сохранение каталога, апдейтер, и т.д.) ---
+                # Проверяется ПЕРВЫМ, до любой другой логики. Раньше здесь и в
+                # апдейтере были два РАЗНЫХ независимых pending-флага, слушавших
+                # одни и те же слова "да"/"нет" — теперь это один общий стек
+                # (updater.set_pending_confirm / consume_pending_confirm), так
+                # что при столкновении вопросов ответ уходит по адресу, а не в
+                # первый попавшийся обработчик.
+                if updater.consume_pending_confirm(user_text):
+                    jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
+                    print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
+                    return
 
                 # --- СТОП-КОМАНДЫ: проверяем ПЕРВЫМИ, до любой другой логики ---
                 STOP_WORDS = [
@@ -2059,6 +2466,11 @@ def background_worker(audio_data_copy):
                 elif realtime_translation_mode:
                     res = process_translator(user_text)
                     if res:
+                        # ✅ FIX: перевод раньше только печатался в консоль
+                        # (process_translator) и озвучивался — в UI/историю/
+                        # jarvis_chat_log.json не попадал вообще.
+                        jarvis_ui.add_log("jarvis", res["content"])
+                        conversation_history.append({"role": "jarvis", "text": res["content"]})
                         _run_async(play_voice_async(res["content"], res["voice"], force_virtual=True))
                     else:
                         print(f"[!] Пропущена фраза из-за ошибки сервера: {user_text}")
@@ -2067,6 +2479,8 @@ def background_worker(audio_data_copy):
                 elif translator_mode:
                     res = process_translator(user_text)
                     if res:
+                        jarvis_ui.add_log("jarvis", res["content"])
+                        conversation_history.append({"role": "jarvis", "text": res["content"]})
                         _run_async(play_voice_async(res["content"], res["voice"]))
                     recording = False
                     conversation_mode = False
@@ -2177,11 +2591,15 @@ def background_worker(audio_data_copy):
 
                             if _chose_tab or (not _chose_cmd and not _chose_tab):
                                 # По умолчанию (не понял) — закрываем вкладку
-                                _speak("Закрываю вкладку, сэр.", VOICE_RUSSIAN)
+                                _tab_msg = "Закрываю вкладку, сэр."
+                                jarvis_ui.add_log("jarvis", _tab_msg)
+                                _speak(_tab_msg, VOICE_RUSSIAN)
                                 close_app_safe(_close_without_cmd)
                             else:
                                 # Пользователь сказал "команду" — выполняем команду
-                                _speak(f"Выполняю команду, сэр.", VOICE_RUSSIAN)
+                                _cmd_msg = "Выполняю команду, сэр."
+                                jarvis_ui.add_log("jarvis", _cmd_msg)
+                                _speak(_cmd_msg, VOICE_RUSSIAN)
                                 _exec_custom_command(_matched_cmd)
 
                             recording = False
@@ -2211,6 +2629,19 @@ def background_worker(audio_data_copy):
                     ]
                     if any(w in t for w in SELF_SHUTDOWN_WORDS):
                         _run_async(play_voice_async("До свидания, сэр.", VOICE_RUSSIAN))
+                        # ── Статистика: этот путь выключения раньше вызывал
+                        # os._exit(0) напрямую, минуя _close_app() в jarvis_ui.py —
+                        # из-за этого вся очередь событий за сессию (громкость,
+                        # заметки, буфер обмена, ai_query и т.д.) оставалась
+                        # неотправленной. Дублируем здесь ту же логику: фиксируем
+                        # app_close и пытаемся отправить очередь одним коротким
+                        # блокирующим запросом перед выходом.
+                        if analytics:
+                            try:
+                                analytics.track("app_close")
+                                analytics.flush()
+                            except Exception as _e:
+                                print(f"[ANALYTICS] Ошибка при отправке статистики перед выходом: {_e}")
                         import os as _os; _os._exit(0)
 
                     # Локальный перехват: закрыть приложение/папку (без API)
@@ -2243,6 +2674,7 @@ def background_worker(audio_data_copy):
                                 else:
                                     _q = "Сэр, что именно закрыть? Назовите приложение или сайт."
                                 print(f"[LOCAL] Уточнение: {_q}")
+                                jarvis_ui.add_log("jarvis", _q)
                                 _speak(_q, VOICE_RUSSIAN)
                                 recording = False
                                 conversation_mode = False
@@ -2265,6 +2697,7 @@ def background_worker(audio_data_copy):
 
                         msg = "Закрыто, сэр." if ok else f"Сэр, не удалось закрыть '{clean}'."
                         print(f"[Jarvis]: {msg}")
+                        jarvis_ui.add_log("jarvis", msg)
                         _speak(msg, VOICE_RUSSIAN)
                         recording = False
                         conversation_mode = False
@@ -2294,11 +2727,13 @@ def background_worker(audio_data_copy):
                                     if entry.is_dir() and clean in entry.name.lower():
                                         found = entry.path
                                         break
-                            except:
+                            except Exception:
                                 pass
                             if found:
                                 break
                         _run_async(play_voice_async("Выполняю", VOICE_RUSSIAN, silent=True))
+                        if analytics:
+                            analytics.track("open_folder")
                         if found:
                             os.startfile(found)
                             _last_opened = {"type": "folder", "name": clean, "target": os.path.basename(found).lower()}
@@ -2306,21 +2741,24 @@ def background_worker(audio_data_copy):
                         else:
                             msg = f"Сэр, папка '{clean}' не найдена."
                         print(f"[Jarvis]: {msg}")
+                        jarvis_ui.add_log("jarvis", msg)
                         _speak(msg, VOICE_RUSSIAN)
                         recording = False
                         conversation_mode = False
                         print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
                         return
 
-                    # ── Голосовое подтверждение для апдейтера (да/нет) ──────────
-                    if updater.consume_pending_confirm(user_text):
-                        jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
-                        print("\n>>> ЖДУ КОМАНДУ 'HEY JARVIS'...")
-                        return
-
                     # ── Расширенные команды (таймер, буфер, скриншот, громкость, заметки, обновления) ──
                     jf_result = jf.try_handle(user_text)
                     if jf_result:
+                        _jf_text = jf_result["content"]
+                        if _jf_text:
+                            print(f"[Jarvis]: {_jf_text}")
+                            jarvis_ui.add_log("jarvis", _jf_text)
+                            conversation_history.append({"role": "jarvis", "text": _jf_text})
+                            max_entries = MAX_HISTORY * 2
+                            if len(conversation_history) > max_entries:
+                                conversation_history = conversation_history[-max_entries:]
                         _speak(jf_result["content"], jf_result["voice"])
                         recording = False
                         conversation_mode = False
@@ -2329,10 +2767,23 @@ def background_worker(audio_data_copy):
                         return
 
                     # Обычный запрос — отправляем в API
+                    if analytics:
+                        analytics.track("ai_query")
                     res = process_logic(user_text)
                     if res:
                         _speak(res["content"], res["voice"])
                         if res.get("shutdown"):
+                            # ── Статистика: тот же случай, что и с локальным
+                            # перехватом SELF_SHUTDOWN_WORDS выше — этот путь
+                            # тоже завершает процесс напрямую через os._exit(0),
+                            # минуя _close_app(). Отправляем очередь событий
+                            # перед выходом, чтобы ничего не терялось.
+                            if analytics:
+                                try:
+                                    analytics.track("app_close")
+                                    analytics.flush()
+                                except Exception as _e:
+                                    print(f"[ANALYTICS] Ошибка при отправке статистики перед выходом: {_e}")
                             import os as _os
                             _os._exit(0)
                     recording = False
@@ -2383,6 +2834,24 @@ _low_score_count = 0
 _voice_frames = 0
 _silence_frames = 0
 _last_voice_time = time.time()
+
+
+def _reset_ww_buffer():
+    """
+    Обнуляет prediction_buffer модели wake word (заполняет нулями,
+    сохраняя длину — deque не поддерживает срез [:], поэтому clear+extend).
+    Нужно вызывать после каждой детекции wake word и после каждого TTS-
+    ответа, чтобы «память» модели не вызвала ложный повторный триггер.
+    Раньше этот блок был продублирован в 3 местах — вынесено сюда.
+    """
+    if ww_model is None:
+        return
+    for key in ww_model.prediction_buffer:
+        buf = ww_model.prediction_buffer[key]
+        n = len(buf)
+        buf.clear()
+        buf.extend([0.0] * n)
+
 
 def callback(indata, frames, time_info, status):
     global recording, audio_buffer, silence_counter, is_speaking
@@ -2444,12 +2913,7 @@ def callback(indata, frames, time_info, status):
             if _ww_fired:
                 # ✅ FIX: Сбрасываем буфер предсказаний сразу после детекции,
                 # чтобы старое высокое значение не вызвало повторный триггер.
-                # prediction_buffer — это deque, срез [:] не поддерживается → clear+extend.
-                for key in ww_model.prediction_buffer:
-                    buf = ww_model.prediction_buffer[key]
-                    n = len(buf)
-                    buf.clear()
-                    buf.extend([0.0] * n)
+                _reset_ww_buffer()
                 if _listening_printed and not _say_and_listen_active:
                     now = time.time()
                     if now < _ww_cooldown_until:
@@ -2510,11 +2974,7 @@ def callback(indata, frames, time_info, status):
                 time.sleep(0.3)  # пауза после окончания речи
                 # ✅ FIX: Принудительно обнуляем буфер предсказаний перед возвратом
                 # в режим ожидания, чтобы исключить ложный триггер от «памяти» модели.
-                for key in ww_model.prediction_buffer:
-                    buf = ww_model.prediction_buffer[key]
-                    n = len(buf)
-                    buf.clear()
-                    buf.extend([0.0] * n)
+                _reset_ww_buffer()
                 # Сдвигаем кулдаун: не реагировать на wake word ещё 2 сек
                 # после окончания TTS-ответа (иначе эхо голоса джарвиса триггерит повторно)
                 _ww_cooldown_until = time.time() + 2.0
@@ -2528,11 +2988,7 @@ def callback(indata, frames, time_info, status):
             audio_buffer = []
             recording = False
             conversation_mode = False
-            for key in ww_model.prediction_buffer:
-                buf = ww_model.prediction_buffer[key]
-                n = len(buf)
-                buf.clear()
-                buf.extend([0.0] * n)
+            _reset_ww_buffer()
             jarvis_ui.set_status("idle", jarvis_ui.t("txt_idle"))
             print("\n>>> ЖДУ КОМАНДУ HEY JARVIS...")
             _listening_printed = True
@@ -2582,6 +3038,14 @@ def stop_tts():
     print("[СТОП] Кнопка стоп нажата.")
 
 
+# ── Статистика: запуск JARVIS ────────────────────────────────────────────
+# Фиксируем сам факт запуска и в фоне пробуем досослать очередь, которая
+# не отправилась при прошлом выключении (если сервер тогда был недоступен).
+# Неблокирующе — не задерживаем появление UI.
+if analytics:
+    analytics.track("app_start")
+    analytics.flush_async()
+
 # Инициализируем UI в главном потоке (требование Qt)
 jarvis_ui.register_settings_callback(_on_settings_saved)
 jarvis_ui.register_stop_tts_callback(stop_tts)
@@ -2608,6 +3072,7 @@ jf.init(
         else os.system("shutdown /r /t 3")
     ),
     opened_list_fn = lambda: opened_by_jarvis,
+    history_fn     = lambda: conversation_history,
 )
 
 # ── Система обновлений ────────────────────────────────────────────────────────

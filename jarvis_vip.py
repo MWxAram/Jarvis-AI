@@ -19,10 +19,73 @@ jarvis_vip.py — проверка VIP-кода кастомизации чер�
 import json
 import urllib.request
 import urllib.error
+import os
+import socket
+import hashlib
+import base64
 from datetime import datetime, timezone, timedelta
 
 VIP_API_URL = "http://localhost:8000/api/vip/verify-code"
 REQUEST_TIMEOUT_SECONDS = 5
+
+
+# ── Шифрование сохранённого VIP-кода ──────────────────────────────────────
+# Раньше vip_code хранился в jarvis_config.json открытым текстом, хотя рядом
+# api_key уже шифруется (jarvis_ui._encrypt_key/_decrypt_key). Для
+# единообразия и чтобы не хранить код доступа в открытом виде, применяем
+# ту же схему: Fernet-ключ, привязанный к машине (username + hostname).
+# Не импортируем jarvis_ui напрямую (jarvis_ui уже импортирует этот модуль —
+# был бы циклический импорт), поэтому логика продублирована здесь в
+# компактном виде.
+
+def _machine_fernet():
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        return None
+    seed = (os.getenv("USERNAME", "") + socket.gethostname()).encode()
+    raw = hashlib.sha256(seed).digest()
+    key = base64.urlsafe_b64encode(raw)
+    return Fernet(key)
+
+
+def _encrypt_code(plain: str) -> str:
+    """Шифрует VIP-код. Возвращает зашифрованную строку или '' при ошибке
+    (например, если пакет cryptography не установлен — тогда вызывающий
+    код должен сохранить как есть, чтобы не потерять код совсем)."""
+    if not plain:
+        return ""
+    f = _machine_fernet()
+    if f is None:
+        return ""
+    try:
+        return f.encrypt(plain.encode()).decode()
+    except Exception:
+        return ""
+
+
+def _decrypt_code(stored: str) -> str:
+    """
+    Расшифровывает сохранённый VIP-код. Поддерживает обратную совместимость:
+    если значение похоже на код в открытом виде (старый формат, например
+    "JRVS-XXXX-XXXX-XXXX"), возвращает его как есть, ничего не расшифровывая.
+    """
+    if not stored:
+        return ""
+    if stored.upper().startswith("JRVS-"):
+        return stored  # старый plaintext-формат — возвращаем как есть
+    f = _machine_fernet()
+    if f is None:
+        return ""
+    try:
+        return f.decrypt(stored.encode()).decode()
+    except Exception:
+        return ""
+
+
+def get_stored_code(config: dict) -> str:
+    """Читает и расшифровывает vip_code из конфига (или '' если нет/битый)."""
+    return _decrypt_code((config.get("vip_code") or "").strip())
 
 # Офлайн-режим: если сервер недоступен, но последняя успешная проверка
 # была не более этого времени назад — пускаем по кэшу. Не делаем это
@@ -123,7 +186,7 @@ def verify_code_with_offline_fallback(code: str, config: dict) -> VipCheckResult
         return result
 
     # ── Сервер недоступен — пробуем офлайн-кэш ───────────────────────────
-    cached_code = config.get("vip_code")
+    cached_code = get_stored_code(config)  # расшифровывается прозрачно
     cached_valid = config.get("vip_last_valid")
     cached_check_at = _parse_iso(config.get("vip_last_check_at"))
     cached_expires_at = _parse_iso(config.get("vip_last_expires_at"))
@@ -162,8 +225,10 @@ def build_cache_update(code: str, result: VipCheckResult) -> dict:
     if result.from_cache:
         return {}
 
+    stored_code = _encrypt_code(code) or code  # если шифрование недоступно — не теряем код
+
     return {
-        "vip_code": code,
+        "vip_code": stored_code,
         "vip_last_valid": result.valid,
         "vip_last_check_at": _now_utc().isoformat(),
         "vip_last_expires_at": result.expires_at.isoformat() if result.expires_at else None,

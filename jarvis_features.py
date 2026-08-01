@@ -15,6 +15,12 @@ from __future__ import annotations
 import os, json, threading, time, re, io, datetime
 from pathlib import Path
 
+try:
+    import jarvis_analytics as _analytics
+except Exception as _e:
+    _analytics = None
+    print(f"[ANALYTICS] jarvis_analytics.py не загружен ({_e}) — сбор статистики недоступен.")
+
 
 # ════════════════════════════════════════════════════════════════════
 #  HELPERS (injected by main_app at startup)
@@ -35,16 +41,17 @@ _open_url        = None   # _open_browser_url(url, name) → dict
 _close_browser   = None   # close_browser_tab(site_name, mode)
 _shutdown        = None   # lambda action: системное действие (shutdown/restart)
 _get_opened_list = None   # lambda: ссылка на список opened_by_jarvis
+_get_history     = None   # lambda: ссылка на conversation_history (для disambiguation "о какой программе речь")
 
 def init(play_voice_fn, get_client_fn, get_model_fn,
          get_ru_fn, get_en_fn, set_status_fn, add_log_fn,
          open_app_fn=None, close_app_fn=None,
          open_url_fn=None, close_browser_fn=None,
-         shutdown_fn=None, opened_list_fn=None):
+         shutdown_fn=None, opened_list_fn=None, history_fn=None):
     """Call once from main_app after imports."""
     global _play_voice, _get_ai_client, _get_model_id
     global _get_voice_ru, _get_voice_en, _set_ui_status, _add_ui_log
-    global _open_app, _close_app, _open_url, _close_browser, _shutdown, _get_opened_list
+    global _open_app, _close_app, _open_url, _close_browser, _shutdown, _get_opened_list, _get_history
     _play_voice    = play_voice_fn
     _get_ai_client = get_client_fn
     _get_model_id  = get_model_fn
@@ -59,13 +66,19 @@ def init(play_voice_fn, get_client_fn, get_model_fn,
     _close_browser    = close_browser_fn  # close_browser_tab(site_name, mode)
     _shutdown         = shutdown_fn       # lambda action: os.system(...)
     _get_opened_list  = opened_list_fn    # lambda: opened_by_jarvis list ref
+    _get_history      = history_fn        # lambda: conversation_history list ref
     print("[FEATURES] Модуль расширений инициализирован.")
     # Запускаем фоновый поток напоминаний (notes reminder)
     threading.Thread(target=_notes_reminder_loop, daemon=True,
                      name="JarvisNotesReminder").start()
-    # Проверка обновлений при старте (тихая, без голоса)
-    threading.Thread(target=lambda: check_updates(silent=True),
-                     daemon=True, name="JarvisUpdateCheck").start()
+    # ПРИМЕЧАНИЕ: проверка обновлений при старте НЕ запускается здесь —
+    # это делает main_app.py через updater.check_startup() (один раз,
+    # с задержкой 6 сек, после того как UI успел появиться). Раньше тут
+    # был ещё один параллельный вызов check_updates(silent=True) без
+    # задержки — оба потока независимо находили одно и то же обновление,
+    # из-за чего Jarvis дважды подряд спрашивал голосом "установить
+    # обновление?". Голосовые/ручные команды ("проверь обновления")
+    # по-прежнему работают через check_updates() ниже.
 
 
 _BASE = Path(__file__).parent
@@ -674,6 +687,111 @@ def check_updates(silent: bool = False) -> str:
         return msg
 
 
+# ── Вопросы про ИСТОРИЮ обновлений ("что было в версии 0.9?") ────────────────
+# В отличие от check_updates() выше (который качает и ставит файлы самой
+# программы), это просто чтение журнала изменений с сайта — ничего не
+# устанавливает.
+
+# Небольшой best-effort словарь для распознавания «о какой ещё программе,
+# кроме Джарвиса, могла идти речь» — ни в коем случае не исчерпывающий список
+# всех существующих программ, просто разумный набор самых частых.
+_SELF_REF_WORDS = {"джарвис", "jarvis", "тебя", "себя", "тебе", "свой", "своё", "свои", "своя"}
+_KNOWN_OTHER_PROGRAMS = {
+    "chrome": "Chrome", "хром": "Chrome",
+    "firefox": "Firefox", "фаерфокс": "Firefox", "файрфокс": "Firefox",
+    "edge": "Edge", "эдж": "Edge",
+    "opera": "Opera", "опера": "Opera",
+    "steam": "Steam", "стим": "Steam",
+    "discord": "Discord", "дискорд": "Discord",
+    "telegram": "Telegram", "телеграм": "Telegram", "телеграмм": "Telegram",
+    "whatsapp": "WhatsApp", "ватсап": "WhatsApp",
+    "photoshop": "Photoshop", "фотошоп": "Photoshop",
+    "spotify": "Spotify", "спотифай": "Spotify",
+    "zoom": "Zoom", "skype": "Skype", "скайп": "Skype",
+    "windows": "Windows", "виндовс": "Windows",
+    "unity": "Unity", "blender": "Blender",
+    "vs code": "VS Code", "visual studio": "Visual Studio",
+}
+
+
+def _find_other_program(text_lower: str) -> str | None:
+    for kw, display in _KNOWN_OTHER_PROGRAMS.items():
+        if kw in text_lower:
+            return display
+    return None
+
+
+def _handle_update_history_query(text: str, voice_ru: str) -> dict:
+    """
+    Обрабатывает "что нового/добавлено/исправлено в (последнем обновлении|
+    обновлении X|версии X)". Данные берутся из веб-бэкенда (см. updater.py:
+    answer_update_history_query). Если сервер выключен — честно об этом
+    говорим, а не выдумываем ответ.
+
+    Если фраза не уточняет программу явно, а недавно в разговоре упоминалась
+    какая-то ДРУГАЯ программа — переспрашиваем, что именно имелось в виду
+    (своей базы обновлений для сторонних программ у нас нет — если это не
+    Джарвис, фраза просто уходит в обычную обработку/Gemini как обычный
+    вопрос).
+    """
+    import updater
+
+    t_low = text.lower()
+    ver_m = re.search(r'\b(\d+(?:\.\d+){1,3})\b', text)   # версии вида 0.9, 1.0.1
+    query_version = ver_m.group(1) if ver_m else None
+    is_latest = ("последн" in t_low) or not query_version
+
+    def _do_lookup_and_speak():
+        msg = updater.answer_update_history_query(query_version, is_latest)
+        print(f"[UPDATE-HISTORY] {msg}")
+        if _add_ui_log: _add_ui_log("jarvis", msg)
+        if _play_voice: _play_voice(msg, voice_ru)
+
+    self_ref = any(w in t_low for w in _SELF_REF_WORDS)
+
+    if not self_ref:
+        # Программа явно названа ПРЯМО В ЭТОЙ ЖЕ фразе, и это не Джарвис —
+        # своей базы для неё нет, не перехватываем вопрос вообще: пусть
+        # ответит обычная логика (Gemini), как на любой другой вопрос.
+        if _find_other_program(t_low):
+            return None
+
+        # Явного указания нет вообще — смотрим, не обсуждали ли недавно
+        # какую-то другую программу (последние несколько реплик разговора).
+        history = _get_history() if _get_history else []
+        recent_program = None
+        for turn in reversed(history[-8:]):
+            found = _find_other_program((turn.get("text") or "").lower())
+            if found:
+                recent_program = found
+                break
+
+        if recent_program:
+            question = (f"Уточните, сэр: вы имеете в виду обновление Джарвиса, "
+                        f"или {recent_program}, о котором мы говорили?")
+
+            def _on_ignore_not_jarvis():
+                # Пользователь имел в виду не Джарвиса (назвал другую
+                # программу или просто продолжил разговор) — своей базы для
+                # неё нет, поэтому ничего не отвечаем сами: его следующая
+                # фраза уйдёт в обычную обработку/Gemini как новый вопрос.
+                print("[UPDATE-HISTORY] Уточнение: пользователь имел в виду не Джарвиса.")
+
+            updater.set_pending_confirm(
+                on_yes=_do_lookup_and_speak,
+                on_no=lambda: None,
+                on_ignore=_on_ignore_not_jarvis,
+                keywords_yes={"джарвис", "jarvis", "тебя", "себя", "тебе"},
+                keywords_no=set(),  # намеренно пусто — см. комментарий выше про on_ignore
+            )
+            return {"content": question, "voice": voice_ru}
+
+    # Явная ссылка на себя, либо в истории не было других программ —
+    # отвечаем сразу, без уточнений.
+    msg = updater.answer_update_history_query(query_version, is_latest)
+    return {"content": msg, "voice": voice_ru}
+
+
 #  COMMAND ROUTER — единая точка входа для main_app
 # ════════════════════════════════════════════════════════════════════
 
@@ -705,6 +823,8 @@ _CMD_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'(удали|убери)\s*(последнюю)?\s*(заметку|напоминание)', re.I), "note_delete"),
     # Обновления
     (re.compile(r'(проверь|проверить|есть ли|ищи)\s*(обновление|обновления|update)', re.I), "check_updates"),
+    (re.compile(r'(что\s+(?:было\s+)?(?:добавлено|нового|изменилось|исправлено|поменялось|обновили))'
+                r'.{0,25}(обновлени\w*|версии\w*|версия)', re.I), "update_history"),
 
     # ── БРАУЗЕР / САЙТЫ (локально, без Gemini) ──────────────────────
     (re.compile(r'(открой|запусти|включи|зайди|перейди|show|open|launch|play)\s+(youtube|ютуб)', re.I), "open_youtube"),
@@ -744,6 +864,14 @@ def try_handle(text: str) -> dict | None:
 
         voice_ru = _get_voice_ru() if _get_voice_ru else "ru-RU-DmitryNeural"
         voice_en = _get_voice_en() if _get_voice_en else "en-GB-ThomasNeural"
+
+        # ── СТАТИСТИКА ──────────────────────────────────────────────
+        # Фиксируем только тип команды (cmd_id) — он уже не содержит
+        # никакого пользовательского текста (например "timer_set",
+        # "open_youtube", "sys_shutdown"). Ни сам текст, ни имена
+        # открытых программ/сайтов/заметок никуда не уходят.
+        if _analytics:
+            _analytics.track(cmd_id)
 
         # ── ТАЙМЕР ──────────────────────────────────────────────────
         if cmd_id == "timer_set":
@@ -884,6 +1012,9 @@ def try_handle(text: str) -> dict | None:
         elif cmd_id == "check_updates":
             result = check_updates(silent=False)
             return {"content": result, "voice": voice_ru}
+
+        elif cmd_id == "update_history":
+            return _handle_update_history_query(text, voice_ru)
 
         # ── БРАУЗЕР / САЙТЫ ─────────────────────────────────────────
         elif cmd_id == "open_youtube":

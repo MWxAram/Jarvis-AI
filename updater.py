@@ -30,6 +30,8 @@ _FILE_URL    = (f"https://raw.githubusercontent.com/{GITHUB_USER}/"
 _PROTECTED = {
     "jarvis_config.json", "jarvis_commands.json",
     "jarvis_notes.json",  "jarvis_chat_log.json",
+    "jarvis_usage.json",           # счётчики токенов/запросов — меняются на каждый ИИ-запрос
+    "jarvis_analytics_queue.json", # локальная очередь аналитики — меняется на каждый track()
     "updater.py",    # нельзя обновить себя пока запущен — заменяется лаунчером
     "version.json",  # манифест — перезаписывается локально через _save_version()
 }
@@ -243,6 +245,7 @@ def _do_download_and_restart(changed: list, remote_ver: str, remote_files: dict)
         _set_pending(
             on_yes=_do_restart,
             on_no=lambda: _say("Перезапуск отложен. Перезапустите вручную для применения обновлений."),
+            on_ignore=lambda: print("[UPDATE] Вопрос о перезапуске проигнорирован — пользователь сменил тему."),
             keywords_yes={"да", "да конечно", "перезапусти", "restart", "yes",
                           "перезагрузи", "окей", "ок", "конечно"},
             keywords_no={"нет", "не надо", "позже", "no", "отмена", "cancel"},
@@ -262,45 +265,88 @@ def _do_restart():
         os._exit(0)
 
 
-# ── Pending voice confirmation ────────────────────────────────────────────────
-# When Jarvis asks a yes/no question, this dict holds the callbacks.
-# main_app checks consume_pending_confirm(user_text) before any other logic.
-_pending: dict | None = None
+# ── Pending voice confirmation (общий менеджер) ───────────────────────────────
+# Раньше апдейтер держал pending-подтверждение в одиночной переменной, а
+# main_app.py держал СВОЁ отдельное pending-подтверждение для сохранения
+# каталога команд (_pending_catalog_save) — оба слушали одни и те же общие
+# слова "да"/"нет", и если оба состояния оказывались активны одновременно,
+# ответ пользователя мог уйти не туда (перехватывался тем, что проверялось
+# первым). Теперь это ОБЩИЙ стек, которым может пользоваться любой модуль
+# (main_app, updater, в будущем — vip и т.д.) через set_pending_confirm().
+# main_app вызывает consume_pending_confirm(user_text) один раз, до любой
+# другой логики, для ВСЕХ таких ожиданий сразу.
+_pending_stack: list[dict] = []
 
-def _set_pending(on_yes, on_no, keywords_yes: set, keywords_no: set):
-    global _pending
-    _pending = {
-        "on_yes":       on_yes,
-        "on_no":        on_no,
-        "yes":          keywords_yes,
-        "no":           keywords_no,
-    }
+
+def set_pending_confirm(on_yes, on_no, keywords_yes: set, keywords_no: set,
+                        on_ignore=None):
+    """
+    Регистрирует одно голосовое да/нет-ожидание.
+      - on_yes   — вызывается, если ответ явно совпал с keywords_yes.
+      - on_no    — вызывается, если ответ явно совпал с keywords_no
+                   (пользователь осознанно отказался).
+      - on_ignore — вызывается (не обязателен), если ответ не совпал НИ С ЧЕМ
+                   из вышеперечисленного — то есть пользователь просто заговорил
+                   о чём-то другом, не ответив на вопрос напрямую. В отличие от
+                   on_no, здесь НЕ нужно голосом озвучивать отмену — фраза
+                   пользователя в этом случае не потребляется (см. ниже) и
+                   уходит в обычную обработку как новая команда/вопрос.
+    Если в моменте уже есть другое незакрытое ожидание (например, апдейтер
+    спросил про перезапуск, а пока пользователь думал — где-то ещё возник
+    вопрос про сохранение каталога), они складываются в стек: проверяется
+    от самого нового к самому старому, чтобы более свежий вопрос не потерялся.
+    """
+    _pending_stack.append({
+        "on_yes":    on_yes,
+        "on_no":     on_no,
+        "on_ignore": on_ignore,
+        "yes":       keywords_yes,
+        "no":        keywords_no,
+    })
+
+
+def _set_pending(on_yes, on_no, keywords_yes: set, keywords_no: set, on_ignore=None):
+    """Внутренний алиас — используется самим updater.py."""
+    set_pending_confirm(on_yes, on_no, keywords_yes, keywords_no, on_ignore=on_ignore)
+
 
 def consume_pending_confirm(user_text: str) -> bool:
     """
-    Called by main_app for every recognised phrase.
-    Returns True if the phrase was consumed as a yes/no answer (skip normal processing).
-    Returns False if there is no pending confirm or phrase doesn't match.
+    Called by main_app for every recognised phrase, до любой другой логики.
+
+    Returns True  — фраза была явным ответом "да"/"нет" на вопрос, дальше
+                    её обрабатывать не нужно (return в background_worker).
+    Returns False — вопроса не было, либо пользователь на него не ответил
+                    впрямую (сказал что-то не относящееся к делу) — в этом
+                    случае ожидание тихо снимается, а фраза уходит в обычную
+                    обработку как новая команда/вопрос. Раньше в этой ветке
+                    Jarvis переспрашивал "да или нет?" и терял реальный вопрос
+                    пользователя — теперь вместо этого он просто отвечает
+                    на то, что пользователь на самом деле сказал.
     """
-    global _pending
-    if _pending is None:
+    if not _pending_stack:
         return False
     t = user_text.strip().lower()
-    if any(k in t for k in _pending["yes"]):
-        cb = _pending["on_yes"]
-        _pending = None
-        try: cb()
-        except Exception as e: print(f"[UPDATE] on_yes error: {e}")
-        return True
-    if any(k in t for k in _pending["no"]):
-        cb = _pending["on_no"]
-        _pending = None
-        try: cb()
-        except Exception as e: print(f"[UPDATE] on_no error: {e}")
-        return True
-    # Neither match — remind user
-    _say("Скажите «да» для подтверждения или «нет» для отмены.")
-    return True   # still consumed — don't pass to normal logic
+    for i in range(len(_pending_stack) - 1, -1, -1):
+        item = _pending_stack[i]
+        if any(k in t for k in item["yes"]):
+            _pending_stack.pop(i)
+            try: item["on_yes"]()
+            except Exception as e: print(f"[PENDING] on_yes error: {e}")
+            return True
+        if any(k in t for k in item["no"]):
+            _pending_stack.pop(i)
+            try: item["on_no"]()
+            except Exception as e: print(f"[PENDING] on_no error: {e}")
+            return True
+    # Ни "да", ни явное "нет" — пользователь просто продолжил разговор о
+    # чём-то другом. Тихо снимаем самый недавний вопрос (без голосовой
+    # отмены — это не осознанный отказ) и пускаем фразу в обычную обработку.
+    item = _pending_stack.pop()
+    if item.get("on_ignore"):
+        try: item["on_ignore"]()
+        except Exception as e: print(f"[PENDING] on_ignore error: {e}")
+    return False
 
 
 def check_and_update(silent: bool = False) -> str:
@@ -366,11 +412,19 @@ def check_and_update(silent: bool = False) -> str:
     def _on_cancel():
         _say("Обновление отменено.")
 
+    def _on_ignore():
+        # Пользователь не ответил на вопрос впрямую, а заговорил о другом —
+        # молча снимаем вопрос (без "обновление отменено"), сама его фраза
+        # уйдёт в обычную обработку. При следующей проверке апдейтер спросит
+        # снова, если обновление всё ещё актуально.
+        print("[UPDATE] Вопрос об установке проигнорирован — пользователь сменил тему.")
+
     # Голосовой вопрос — ответ ловит main_app через consume_pending_confirm()
     _say("Установить обновление?")
     _set_pending(
         on_yes=_on_confirm,
         on_no=_on_cancel,
+        on_ignore=_on_ignore,
         keywords_yes={"да", "да конечно", "установи", "скачай", "yes", "install",
                       "обнови", "загрузи", "конечно", "окей", "ок"},
         keywords_no={"нет", "не надо", "позже", "no", "отмена", "cancel", "пропусти"},
@@ -389,6 +443,117 @@ def check_startup(silent: bool = True):
         time.sleep(6)
         check_and_update(silent=silent)
     threading.Thread(target=_run, daemon=True, name="JarvisUpdateStartup").start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ИСТОРИЯ ОБНОВЛЕНИЙ (журнал версий из веб-бэкенда)
+# ═══════════════════════════════════════════════════════════════════════════
+# Отвечает на вопросы вида "что было в обновлении 0.9?" / "что нового в
+# последнем обновлении?", беря данные из публичного эндпоинта бэкенда
+# GET /api/updates (routers/updates.py, без авторизации). Это ОТДЕЛЬНАЯ вещь
+# от check_and_update() выше: там мы качаем и ставим САМИ ФАЙЛЫ программы по
+# SHA-256 (GitHub), здесь — просто читаем ЖУРНАЛ ИЗМЕНЕНИЙ (текстовое описание
+# версий) с сайта, ничего не устанавливаем.
+UPDATES_HISTORY_API_URL = "http://localhost:8000/api/updates"
+
+_TAG_LABELS_RU = {"new": "Новое", "improved": "Улучшено", "fixed": "Исправлено"}
+
+
+def _parse_version_tuple(v: str):
+    """"1.0.1" → (1, 0, 1). Возвращает None, если в строке нет ни одной цифры."""
+    import re as _re
+    nums = _re.findall(r'\d+', v or "")
+    return tuple(int(n) for n in nums) if nums else None
+
+
+def fetch_update_history(timeout: float = 5):
+    """
+    GET /api/updates — полный журнал обновлений с бэкенда (новые сверху —
+    так их уже отдаёт сам роутер). Возвращает None при сетевой ошибке
+    (бэкенд выключен / нет интернета) — вызывающий код должен явно
+    сообщить об этом пользователю, а не тихо промолчать или выдумать ответ.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(UPDATES_HISTORY_API_URL, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[UPDATE-HISTORY] Сервер недоступен: {e}")
+        return None
+
+
+def format_update_entry_speech(entry: dict) -> str:
+    """Превращает одну запись обновления (из ответа API) в связную речь."""
+    version = entry.get("version", "?")
+    title = (entry.get("title") or "").strip()
+    parts = [f"Версия {version}" + (f", «{title}»" if title else "") + "."]
+
+    by_tag = {"new": [], "improved": [], "fixed": []}
+    for item in (entry.get("changelog") or []):
+        tag = item.get("tag", "new")
+        text = (item.get("text") or "").strip()
+        if text:
+            by_tag.setdefault(tag, []).append(text)
+
+    for tag in ("new", "improved", "fixed"):
+        if by_tag.get(tag):
+            label = _TAG_LABELS_RU.get(tag, tag)
+            parts.append(f"{label}: " + "; ".join(by_tag[tag]) + ".")
+    return " ".join(parts)
+
+
+def answer_update_history_query(query_version: str | None, latest: bool = False) -> str:
+    """
+    Основная точка входа для голосового вопроса про историю обновлений.
+      - latest=True (или query_version не задан) → рассказывает про самое
+        последнее обновление в журнале.
+      - query_version задан → ищет точное совпадение по версии; если такой
+        версии в журнале нет — сравнивает номера версий численно и
+        предлагает две ближайшие существующие (одну до, одну после).
+    """
+    updates = fetch_update_history()
+    if updates is None:
+        return ("Сэр, сейчас не могу получить эту информацию — "
+                "сервер JARVIS недоступен.")
+    if not updates:
+        return "Сэр, в базе пока нет ни одной записи об обновлениях."
+
+    if latest or not query_version:
+        return "Последнее обновление. " + format_update_entry_speech(updates[0])
+
+    # ✅ FIX: раньше сравнивали строки "в лоб" (qv == version.lower()) —
+    # но бэкенд отдаёт версии в формате "V1.0.1", а из голосовой фразы
+    # извлекается "1.0.1" (без V). Строковое сравнение никогда не совпадало,
+    # даже когда версия реально есть в журнале — то же самое ломало и
+    # запасной поиск "ближайшей версии" (v == target тоже не считался ни
+    # меньше, ни больше). Сравниваем по разобранным числовым кортежам
+    # (1, 0, 1) — не зависит от префикса "V", регистра или пробелов.
+    target = _parse_version_tuple(query_version)
+    if target is None:
+        return f"Сэр, не удалось распознать номер версии «{query_version}»."
+
+    exact = next((u for u in updates if _parse_version_tuple(u.get("version", "")) == target), None)
+    if exact:
+        return format_update_entry_speech(exact)
+
+    # Точного совпадения нет — ищем ближайшую снизу и ближайшую сверху
+    # (не по позиции в списке, а по номеру версии).
+    below = above = None
+    below_v = above_v = None
+    for u in updates:
+        v = _parse_version_tuple(u.get("version", ""))
+        if v is None:
+            continue
+        if v < target and (below_v is None or v > below_v):
+            below, below_v = u, v
+        if v > target and (above_v is None or v < above_v):
+            above, above_v = u, v
+
+    msg = f"Сэр, информации об обновлении {query_version} нет."
+    near = [u for u in (below, above) if u]
+    if near:
+        msg += " Ближайшие версии: " + " ".join(format_update_entry_speech(u) for u in near)
+    return msg
 
 
 # ── Утилита для разработчика: генерация version.json ─────────────────────────
