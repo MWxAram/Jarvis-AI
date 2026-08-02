@@ -1,5 +1,5 @@
 {
-  "version": "1.0.4",
+  "version": "1.0.5",
   "files": {
     "jarvis_analytics.py": "211c5547bfd2f65917c87ca6aa3a45fac514f8693f4ac56454198308109239b9",
     "jarvis_features.py": "ac0a491c230e87deb70ab76fbd2057e065438d1963abd62285f6ab86f775af46",
@@ -7,5 +7,7 @@
     "jarvis_vip.py": "6292ae0b4cf125c43795e85eaa7371b013b0401d464eb0e40f733aa6ada0a70d",
     "main_app.py": "b57c0bc93313eaf3381aa301187ee073abca7db69b91bc3f2aa1054e14af1565"
   },
-  "updated": "2026-08-01 15:41:51"
+  "updated": "2026-08-02 21:09:26",
+  "build_sha256": "e216daa72563fd5429c39b0d1396cf268ade808c98e5991fa3bc18f704c9a213",
+  "build_asset": "JARVIS-1.0.5-win64.zip"
 }
