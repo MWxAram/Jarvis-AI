@@ -105,21 +105,64 @@ import psutil
 # Загрузка в фоне позволяет UI появиться быстрее.
 _heavy_loaded = threading.Event()   # взводится когда всё готово
 
+# Заранее объявляем как None — если какой-то из импортов в фоне упадёт,
+# остальной код увидит понятное "не загружено" (None), а не NameError.
+pygame = None
+gTTS = None
+edge_tts = None
+open_app = None
+sf = None
+openwakeword = None
+
 def _load_heavy_imports():
     global pygame, gTTS, edge_tts, open_app, sf, openwakeword
-    import pygame as _pg
-    from gtts import gTTS as _gtts
-    import edge_tts as _edge_tts
-    from AppOpener import open as _open_app
-    import soundfile as _sf
-    import openwakeword as _oww
-    pygame = _pg
-    gTTS = _gtts
-    edge_tts = _edge_tts
-    open_app = _open_app
-    sf = _sf
-    openwakeword = _oww
-    _heavy_loaded.set()
+    # ВАЖНО: каждый импорт — в своём try/except. Раньше все шесть импортов
+    # были в одном блоке без обработки ошибок: если ЛЮБОЙ из них падал
+    # (например, openwakeword/onnxruntime не встал корректно в frozen-сборку),
+    # исключение тихо убивало этот фоновый поток и _heavy_loaded.set() ниже
+    # никогда не вызывался. Из-за этого:
+    #   - _load_ww_model() вечно ждал на _heavy_loaded.wait() → wake-word
+    #     ("Hey Jarvis") никогда не запускался → JARVIS не реагировал на голос;
+    #   - pygame не был инициализирован → воспроизведение TTS тоже не работало.
+    # Теперь падение одной библиотеки не блокирует остальные, а в консоль/
+    # logs.txt печатается точная причина — по ней и чиним конкретный пакет.
+    try:
+        import pygame as _pg
+        pygame = _pg
+    except Exception as e:
+        print(f"[HEAVY IMPORT] pygame не загрузился: {e}")
+
+    try:
+        from gtts import gTTS as _gtts
+        gTTS = _gtts
+    except Exception as e:
+        print(f"[HEAVY IMPORT] gTTS не загрузился: {e}")
+
+    try:
+        import edge_tts as _edge_tts
+        edge_tts = _edge_tts
+    except Exception as e:
+        print(f"[HEAVY IMPORT] edge_tts не загрузился: {e}")
+
+    try:
+        from AppOpener import open as _open_app
+        open_app = _open_app
+    except Exception as e:
+        print(f"[HEAVY IMPORT] AppOpener не загрузился: {e}")
+
+    try:
+        import soundfile as _sf
+        sf = _sf
+    except Exception as e:
+        print(f"[HEAVY IMPORT] soundfile не загрузился: {e}")
+
+    try:
+        import openwakeword as _oww
+        openwakeword = _oww
+    except Exception as e:
+        print(f"[HEAVY IMPORT] openwakeword не загрузился: {e}")
+
+    _heavy_loaded.set()  # выставляем ВСЕГДА, даже если что-то выше упало
 
 # Запускаем фоновую загрузку сразу — к моменту первой команды всё будет готово
 threading.Thread(target=_load_heavy_imports, daemon=True, name="HeavyImports").start()
@@ -3001,7 +3044,12 @@ _ww_model_ready = threading.Event()
 
 def _load_ww_model():
     global ww_model
-    _heavy_loaded.wait()   # ждём пока openwakeword импортирован
+    _heavy_loaded.wait()   # ждём пока openwakeword импортирован (или не импортирован)
+    if openwakeword is None:
+        print("[WAKEWORD] openwakeword не загрузился при старте (см. [HEAVY IMPORT] "
+              "выше) — голосовая активация 'Hey Jarvis' недоступна в этой сессии. "
+              "Обычно чинится установкой Visual C++ Redistributable (x64).")
+        return
     ww_model = openwakeword.Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
     _ww_model_ready.set()
     print(">>> JARVIS ГОТОВ | Жду команду 'HEY JARVIS'...")
