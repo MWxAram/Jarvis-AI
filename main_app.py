@@ -13,6 +13,10 @@ import winreg
 import ctypes
 import webbrowser
 import subprocess
+import zipfile
+import shutil
+import urllib.request
+import importlib.util
 from ctypes import wintypes
 from datetime import datetime
 
@@ -114,6 +118,76 @@ open_app = None
 sf = None
 openwakeword = None
 
+# URL известно-рабочей версии пакета openwakeword — используется, только если
+# обычный "import openwakeword" падает (см. ниже). Залей openwakeword.zip
+# (папка openwakeword/... внутри архива, БЕЗ __pycache__) в GitHub Release
+# этого репозитория и подставь сюда точную ссылку на asset.
+_OWW_FIX_URL = "https://github.com/MWxAram/Jarvis-AI/releases/download/openwakeword-fix/openwakeword.zip"
+
+
+def _repair_openwakeword() -> bool:
+    """
+    Скачивает известно-рабочую версию пакета openwakeword и подменяет ею
+    установленную — на практике встречалась сборка, где версия openwakeword,
+    подтянутая pip'ом (requirements.txt не пинует точную версию), несовместима
+    с окружением и падает при импорте с "DLL load failed while importing
+    onnxruntime_pybind11_state" — при этом сам onnxruntime не сломан, ломает
+    именно эта версия openwakeword. Подмена пакета на известно-рабочую версию
+    это чинит.
+
+    ТОЛЬКО текст в консоль/logs.txt — без голоса: голосовое объявление здесь
+    перебивалось параллельным озвучиванием проверки обновлений (см. main_app
+    → check_startup), и звук просто обрывался на середине. Печатать надёжнее.
+
+    ВАЖНО: НЕ пытается тут же повторно импортировать openwakeword и продолжить
+    работу в этой же сессии — Python уже мог что-то закэшировать/частично
+    инициализировать при первой неудачной попытке импорта, поэтому после
+    подмены файлов требуется полный перезапуск процесса. Функция только
+    готовит файлы и просит перезапуск; повторный импорт НЕ делает.
+
+    Возвращает True, если файлы подменены успешно (не значит, что импорт
+    заработает — это будет ясно уже при следующем запуске).
+    """
+    try:
+        # find_spec просто НАХОДИТ пакет на диске, не выполняя его код —
+        # работает, даже если сам import падает при выполнении __init__.py.
+        spec = importlib.util.find_spec("openwakeword")
+        if spec is None or not spec.origin:
+            print("[REPAIR] openwakeword не найден в site-packages — чинить нечего.")
+            return False
+        pkg_dir = os.path.dirname(spec.origin)          # .../site-packages/openwakeword
+        site_packages_dir = os.path.dirname(pkg_dir)
+
+        print("[REPAIR] openwakeword не загрузился — качаю известно-рабочую версию...")
+        with urllib.request.urlopen(_OWW_FIX_URL, timeout=30) as resp:
+            data = resp.read()
+
+        # Сначала распаковываем во временную папку и проверяем, что внутри
+        # архива действительно лежит "openwakeword/" — только потом сносим
+        # старую версию, чтобы при битом/неверном архиве не остаться без
+        # пакета вообще.
+        tmp_extract = pkg_dir + "_repair_tmp"
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extractall(tmp_extract)
+        new_pkg_dir = os.path.join(tmp_extract, "openwakeword")
+        if not os.path.isdir(new_pkg_dir):
+            print("[REPAIR] В архиве не нашлась папка openwakeword/ — отмена.")
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+            return False
+
+        shutil.rmtree(pkg_dir, ignore_errors=True)
+        shutil.move(new_pkg_dir, pkg_dir)
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+
+        print(f"[REPAIR] openwakeword переустановлен в {pkg_dir}.")
+        print("[REPAIR] Требуется перезапуск JARVIS, чтобы изменения вступили в силу.")
+        return True
+    except Exception as e:
+        print(f"[REPAIR] Не удалось автоматически починить openwakeword: {e}")
+        return False
+
+
 def _load_heavy_imports():
     global pygame, gTTS, edge_tts, open_app, sf, openwakeword
     # ВАЖНО: каждый импорт — в своём try/except. Раньше все шесть импортов
@@ -161,6 +235,12 @@ def _load_heavy_imports():
         openwakeword = _oww
     except Exception as e:
         print(f"[HEAVY IMPORT] openwakeword не загрузился: {e}")
+        if _repair_openwakeword():
+            print("[HEAVY IMPORT] Автопочинка завершена. Закройте JARVIS и запустите "
+                  "заново, чтобы голосовая активация 'Hey Jarvis' заработала.")
+        else:
+            print("[HEAVY IMPORT] Автопочинка не удалась — голосовая активация "
+                  "'Hey Jarvis' недоступна в этой сессии.")
 
     _heavy_loaded.set()  # выставляем ВСЕГДА, даже если что-то выше упало
 
@@ -3048,7 +3128,7 @@ def _load_ww_model():
     if openwakeword is None:
         print("[WAKEWORD] openwakeword не загрузился при старте (см. [HEAVY IMPORT] "
               "выше) — голосовая активация 'Hey Jarvis' недоступна в этой сессии. "
-              "Обычно чинится установкой Visual C++ Redistributable (x64).")
+              "Если сработала автопочинка (см. [REPAIR] в логе), перезапустите JARVIS.")
         return
     ww_model = openwakeword.Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
     _ww_model_ready.set()

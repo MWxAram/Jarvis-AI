@@ -1,46 +1,24 @@
 """
-updater.py — умная система обновлений JARVIS
-=============================================
+updater.py — система обновлений JARVIS
+=======================================
 
-ДВА РЕЖИМА РАБОТЫ (определяются автоматически через sys.frozen):
+Качает version.json с GitHub, сравнивает SHA-256 каждого .py-файла и
+докачивает только изменённые файлы поштучно — так же, как раньше в
+dev-режиме. Это единственный режим: JARVIS больше не собирается через
+PyInstaller (см. README_BUILD.md), поэтому sys.frozen никогда не
+выставляется, а поштучное обновление подходит всегда — исходники лежат
+рядом с Jarvis.exe как обычные .py-файлы, а не запечены внутрь бандла.
 
-  1) РЕЖИМ РАЗРАБОТКИ (запуск как `python main_app.py`, sys.frozen нет):
-     Старый механизм без изменений — качает version.json с GitHub,
-     сравнивает SHA-256 каждого .py-файла и докачивает только изменённые
-     файлы поштучно. Удобно на машине разработчика: правки сразу видны,
-     не нужно каждый раз пересобирать .exe.
-
-  2) РЕЖИМ FROZEN (собранный JARVIS.exe через PyInstaller):
-     Поштучная замена .py-файлов здесь БЕССМЫСЛЕННА — все модули запечены
-     внутрь бандла (dist\\JARVIS\\_internal\\...), отдельных .py-файлов
-     рядом с .exe нет, и заменить их — значит ничего не изменить в
-     реально работающем процессе. Поэтому вместо этого:
-       - version.json дополнительно содержит "build_sha256" — хеш ЦЕЛОГО
-         zip-архива готовой сборки (dist\\JARVIS, упакованный в .zip и
-         выложенный в GitHub Releases).
-       - Если build_sha256 в манифесте отличается от того, что записано
-         локально — скачиваем этот zip целиком, проверяем его хеш,
-         распаковываем во временную папку и запускаем маленький .bat,
-         который: ждёт закрытия JARVIS.exe → копирует новые файлы поверх
-         старых (robocopy, БЕЗ /MIR — то есть ничего лишнего не удаляет,
-         так что jarvis_config.json/logs.txt и т.п. не трогаются, они
-         просто не входят в архив сборки) → перезапускает JARVIS.exe →
-         подчищает за собой временную папку и себя самого.
-
-  Для разработчика: после сборки .exe (JARVIS.spec) и упаковки
-  dist\\JARVIS в zip запусти:
-      python updater.py --generate 1.0.5 --build-zip JARVIS-1.0.5-win64.zip
-  Это создаст version.json с обоими наборами данных ("files" — для
-  dev-режима, "build_sha256"/"build_asset" — для frozen-режима) одной
-  командой. Дальше просто загрузи version.json на GitHub (main-ветка) и
-  сам zip — в GitHub Releases под тегом vX.Y.Z (или пропиши свой URL в
-  "build_url" внутри version.json, если хранишь архив в другом месте).
+Для разработчика: после правок в .py-файлах запусти:
+    python updater.py --generate 1.0.9
+Это создаст version.json с SHA-256 всех файлов. Дальше просто загрузи
+его вместе с изменёнными .py-файлами на GitHub (main-ветка).
 
 Папки python_env/ venv/ и пользовательские JSON — никогда не трогаются.
 """
 
 from __future__ import annotations
-import hashlib, json, os, sys, threading, time, shutil, py_compile, zipfile, tempfile, subprocess
+import hashlib, json, os, sys, threading, time, shutil, py_compile, subprocess
 from pathlib import Path
 from typing   import Callable
 
@@ -54,20 +32,8 @@ _VERSION_URL = (f"https://raw.githubusercontent.com/{GITHUB_USER}/"
 _FILE_URL    = (f"https://raw.githubusercontent.com/{GITHUB_USER}/"
                 f"{GITHUB_REPO}/{GITHUB_BRANCH}/{{path}}")
 
-# Имя exe внутри собранной папки (JARVIS.spec: name="JARVIS") — используется,
-# чтобы найти процесс/файл при перезапуске и проверить целостность архива.
-_EXE_NAME = "JARVIS.exe"
 
-# Шаблон URL релизного архива на GitHub Releases, если в version.json не
-# указан явный "build_url". Тег релиза ожидается в виде vX.Y.Z.
-def _default_build_url(version: str, asset_name: str | None) -> str:
-    asset = asset_name or f"JARVIS-{version}-win64.zip"
-    return f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/download/v{version}/{asset}"
-
-
-# Файлы и папки, которые НИКОГДА не трогаем (актуально для dev-режима —
-# в frozen-режиме защита обеспечивается тем, что этих файлов просто нет
-# в скачиваемом zip-архиве сборки, см. докстринг модуля выше).
+# Файлы и папки, которые НИКОГДА не трогаем.
 _PROTECTED = {
     "jarvis_config.json", "jarvis_commands.json",
     "jarvis_notes.json",  "jarvis_chat_log.json",
@@ -76,7 +42,7 @@ _PROTECTED = {
     "updater.py",    # нельзя обновить себя пока запущен — заменяется лаунчером
     "version.json",  # манифест — перезаписывается локально через _save_version()
 }
-_PROTECTED_DIRS = ("python_env", "venv", ".git", "__pycache__")
+_PROTECTED_DIRS = ("python", "python_env", "venv", ".git", "__pycache__")
 
 # Модули проекта, которые импортируются друг другом во время работы
 # (jarvis_ui импортирует jarvis_vip; main_app импортирует updater,
@@ -84,22 +50,13 @@ _PROTECTED_DIRS = ("python_env", "venv", ".git", "__pycache__")
 # делаем py_compile-проверку синтаксиса — битый файл от плохого релиза
 # не должен молча подменить рабочий модуль и заставить, например,
 # jarvis_ui.py откатиться в режим "_vip = None" после перезапуска
-# без внятного объяснения пользователю. (Актуально только для dev-режима.)
+# без внятного объяснения пользователю.
 _CRITICAL_MODULES = {
     "jarvis_vip.py", "jarvis_features.py", "jarvis_ui.py", "main_app.py",
 }
 
-# ── Определяем режим и папку установки ────────────────────────────────────
-# sys.frozen выставляется PyInstaller-ом в True для собранного .exe.
-_IS_FROZEN = getattr(sys, "frozen", False)
-
-if _IS_FROZEN:
-    # sys.executable — это сам JARVIS.exe (надёжнее argv[0], который в
-    # редких случаях может отличаться, например при запуске через ярлык
-    # с параметрами).
-    _BASE = Path(sys.executable).parent.resolve()
-else:
-    _BASE = Path(sys.argv[0]).parent.resolve()
+# ── Папка установки ─────────────────────────────────────────────────────
+_BASE = Path(sys.argv[0]).parent.resolve()
 
 # ── Callbacks — устанавливаются из main_app через init_updater() ──────────────
 _voice_fn  : Callable | None = None
@@ -119,8 +76,7 @@ def init_updater(voice_fn, log_fn, status_fn, voice_ru: str,
     _log_fn   = log_fn
     _status_fn = status_fn
     _voice_ru  = voice_ru
-    mode = "frozen (.exe)" if _IS_FROZEN else "dev (python)"
-    print(f"[UPDATE] Модуль обновлений инициализирован. Режим: {mode}. Папка: {_BASE}")
+    print(f"[UPDATE] Модуль обновлений инициализирован. Папка: {_BASE}")
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -174,22 +130,8 @@ def _get_local_version() -> str:
         return "0.0.0"
 
 
-def _get_local_build_sha() -> str:
-    """Хеш ЦЕЛОГО zip-архива сборки, который сейчас установлен (frozen-режим).
-    Пусто, если ещё ни разу не обновлялись через этот механизм (например,
-    самая первая установка, поставленная напрямую через инсталлятор) —
-    в этом случае просто доверяем версии из локального version.json и не
-    докачиваем архив, пока version действительно не разойдётся."""
-    try:
-        d = json.loads((_BASE / "version.json").read_text(encoding="utf-8"))
-        return d.get("build_sha256", "")
-    except Exception:
-        return ""
-
-
 def _find_changed(remote_files: dict) -> list[tuple[str, str]]:
-    """Возвращает список (rel_path, remote_sha) только для изменённых файлов.
-    Используется только в dev-режиме (см. докстринг модуля)."""
+    """Возвращает список (rel_path, remote_sha) только для изменённых файлов."""
     changed = []
     for rel, remote_sha in remote_files.items():
         if _skip(rel):
@@ -206,7 +148,6 @@ def _is_valid_python(path: Path) -> bool:
     Используется только для критичных модулей перед тем, как принять
     скачанную версию — чтобы битый релиз с GitHub не тихо подменил
     рабочий jarvis_vip.py / jarvis_features.py / jarvis_ui.py / main_app.py.
-    (Только dev-режим.)
     """
     try:
         py_compile.compile(str(path), doraise=True)
@@ -217,7 +158,7 @@ def _is_valid_python(path: Path) -> bool:
 
 
 def _download_file(rel: str, expected_sha: str) -> bool:
-    """Скачивает и подменяет ОДИН .py-файл. Только dev-режим."""
+    """Скачивает и подменяет ОДИН .py-файл."""
     data = _fetch(_FILE_URL.format(path=rel.replace(os.sep, "/")))
     if data is None:
         return False
@@ -243,20 +184,10 @@ def _download_file(rel: str, expected_sha: str) -> bool:
         return False
 
 
-def _save_version(ver: str, files: dict, build_sha256: str | None = None):
-    """Сохраняет версию локально. build_sha256 сохраняется, только если
-    передан явно (frozen-режим) — иначе поле остаётся как было (dev-режим
-    его не трогает, чтобы не затирать значение, записанное frozen-режимом
-    ранее на этой же машине)."""
+def _save_version(ver: str, files: dict):
+    """Сохраняет версию локально."""
     payload = {"version": ver, "files": files,
                "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
-    if build_sha256 is not None:
-        payload["build_sha256"] = build_sha256
-    else:
-        # сохраняем предыдущее значение, если было
-        prev = _get_local_build_sha()
-        if prev:
-            payload["build_sha256"] = prev
     try:
         (_BASE / "version.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -275,160 +206,9 @@ def _get_local_files_record() -> dict:
         return {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FROZEN-РЕЖИМ: скачивание/установка целой сборки
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _extract_and_stage(zip_bytes: bytes) -> Path | None:
-    """Распаковывает zip во временную папку и проверяет, что внутри
-    действительно лежит JARVIS.exe (защита от битого/левого архива —
-    не хотим готовить подмену на основе мусора)."""
-    staging = Path(tempfile.mkdtemp(prefix="jarvis_update_"))
-    try:
-        with zipfile.ZipFile(__import__("io").BytesIO(zip_bytes)) as zf:
-            zf.extractall(staging)
-    except Exception as e:
-        print(f"[UPDATE] Не удалось распаковать архив обновления: {e}")
-        shutil.rmtree(staging, ignore_errors=True)
-        return None
-
-    # Архив может содержать сам JARVIS.exe либо в корне, либо в одной
-    # вложенной папке (частый случай при zip "dist\JARVIS" -> JARVIS/...).
-    # Находим папку, где реально лежит EXE, и используем её как источник.
-    if (staging / _EXE_NAME).exists():
-        return staging
-    for sub in staging.iterdir():
-        if sub.is_dir() and (sub / _EXE_NAME).exists():
-            return sub
-
-    print("[UPDATE] В скачанном архиве не найден JARVIS.exe — отменяю установку.")
-    shutil.rmtree(staging, ignore_errors=True)
-    return None
-
-
-def _write_and_launch_swap_script(source_dir: Path, app_dir: Path):
-    """
-    Пишет .bat, который:
-      1) ждёт, пока текущий процесс JARVIS.exe реально завершится,
-      2) копирует новые файлы поверх старых (robocopy БЕЗ /MIR — ничего
-         лишнего не удаляет, поэтому jarvis_config.json / logs.txt и
-         прочие пользовательские файлы в app_dir остаются нетронутыми,
-         они попросту не входят в source_dir),
-      3) запускает обновлённый JARVIS.exe,
-      4) удаляет временную папку и сам себя.
-    Запускается ДО того, как текущий процесс завершится (os._exit ниже) —
-    поэтому шаг 1 обязателен, а не просто "подождать секунду".
-    """
-    pid = os.getpid()
-    bat_path = Path(tempfile.gettempdir()) / f"jarvis_update_{pid}.bat"
-    bat_content = f"""@echo off
-setlocal
-set "PID={pid}"
-set "SRC={source_dir}"
-set "DST={app_dir}"
-
-:waitloop
-tasklist /fi "PID eq %PID%" 2>nul | find "%PID%" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto waitloop
-)
-
-robocopy "%SRC%" "%DST%" /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS >nul
-
-start "" "%DST%\\{_EXE_NAME}"
-
-rmdir /s /q "%SRC%" >nul 2>nul
-(goto) 2>nul & del "%~f0"
-"""
-    bat_path.write_text(bat_content, encoding="utf-8")
-
-    # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP — чтобы .bat пережил
-    # завершение текущего процесса (os._exit ниже) и не унаследовал от
-    # него никаких хендлов, из-за которых Windows могла бы отказаться
-    # считать процесс завершённым в `tasklist`-проверке выше.
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
-    subprocess.Popen(
-        ["cmd", "/c", str(bat_path)],
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-    )
-
-
-def _do_download_and_apply_frozen(remote_ver: str, build_sha: str,
-                                   build_url: str):
-    """Скачивает архив сборки, готовит подмену и просит перезапустить."""
-    _say(f"Скачиваю обновление до версии {remote_ver}. Это может занять минуту.")
-    data = _fetch(build_url, timeout=120)
-    if data is None:
-        _say("Сэр, не удалось скачать архив обновления. Проверьте подключение.")
-        return
-    if _sha256_bytes(data) != build_sha:
-        _say("Сэр, скачанный архив обновления повреждён (не совпал контрольный хеш). Отменяю установку.")
-        return
-
-    staging = _extract_and_stage(data)
-    if staging is None:
-        _say("Сэр, архив обновления оказался некорректным. Отменяю установку.")
-        return
-
-    # Кладём version.json с новыми данными ВНУТРЬ staging — после
-    # robocopy он окажется на месте старого автоматически, без отдельной
-    # гонки "успели ли мы дописать файл до старта .bat".
-    try:
-        (staging / "version.json").write_text(
-            json.dumps({
-                "version": remote_ver,
-                "files": _get_local_files_record(),
-                "build_sha256": build_sha,
-                "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-    except Exception as e:
-        print(f"[UPDATE] Не удалось подготовить version.json в staging: {e}")
-
-    _say(f"Обновление скачано, версия {remote_ver} готова к установке. Перезапустить и установить сейчас?")
-
-    def _on_confirm():
-        _say("Устанавливаю обновление и перезапускаюсь.")
-        time.sleep(1.0)
-        try:
-            _write_and_launch_swap_script(staging, _BASE)
-        except Exception as e:
-            print(f"[UPDATE] Не удалось запустить установку обновления: {e}")
-            _say("Сэр, не удалось запустить установку обновления.")
-            return
-        os._exit(0)
-
-    def _on_cancel():
-        _say("Хорошо, обновление не будет установлено сейчас. При следующей проверке предложу снова.")
-        shutil.rmtree(staging, ignore_errors=True)
-
-    def _on_ignore():
-        print("[UPDATE] Вопрос об установке (frozen) проигнорирован — пользователь сменил тему.")
-        # Оставляем staging на диске — если пользователь позже согласится
-        # без повторного вопроса, он всё равно не сможет — pending уже
-        # снят. Проще и безопаснее один раз почистить: следующая проверка
-        # перекачает архив заново, это дешевле, чем гонятся за отложенным
-        # confirm-состоянием без вопроса на экране.
-        shutil.rmtree(staging, ignore_errors=True)
-
-    _set_pending(
-        on_yes=_on_confirm,
-        on_no=_on_cancel,
-        on_ignore=_on_ignore,
-        keywords_yes={"да", "да конечно", "установи", "перезапусти", "yes", "install",
-                      "обнови", "конечно", "окей", "ок", "restart"},
-        keywords_no={"нет", "не надо", "позже", "no", "отмена", "cancel", "пропусти"},
-    )
-
-
-# ── Основная логика (dev-режим, поштучные файлы) ──────────────────────────────
+# ── Основная логика: скачивание изменённых файлов ─────────────────────────
 def _do_download_and_restart(changed: list, remote_ver: str, remote_files: dict):
-    """Скачивает изменённые файлы, затем голосом предлагает перезапуск.
-    Только dev-режим (см. докстринг модуля)."""
+    """Скачивает изменённые файлы, затем голосом предлагает перезапуск."""
     ok, fail, fail_critical = 0, [], []
     for rel, sha in changed:
         if _download_file(rel, sha):
@@ -551,11 +331,9 @@ def check_and_update(silent: bool = False) -> str:
 
     silent=True  → не говорит если всё актуально (только при старте).
     silent=False → всегда отвечает голосом.
-
-    Ветвится на dev/frozen режим сразу после получения манифеста.
     """
     local_ver = _get_local_version()
-    print(f"[UPDATE] локальная версия: {local_ver} | режим: {'frozen' if _IS_FROZEN else 'dev'}")
+    print(f"[UPDATE] локальная версия: {local_ver}")
 
     raw = _fetch(_VERSION_URL)
     if raw is None:
@@ -575,40 +353,6 @@ def check_and_update(silent: bool = False) -> str:
         return msg
 
     remote_ver = manifest.get("version", "0.0.0")
-
-    # ═══════════════════════════════ FROZEN ═══════════════════════════════
-    if _IS_FROZEN:
-        remote_build_sha = manifest.get("build_sha256", "")
-        local_build_sha  = _get_local_build_sha()
-
-        if not remote_build_sha:
-            # Разработчик ещё не выложил build_sha256 в version.json —
-            # значит релиз для frozen-режима не подготовлен. Не пытаемся
-            # угадывать URL архива вслепую.
-            msg = ("Сэр, версия на сервере не содержит данных о готовой сборке — "
-                   "автообновление для установленной версии пока недоступно.")
-            if not silent: _say(msg)
-            else: print(f"[UPDATE] {msg}")
-            return msg
-
-        if remote_build_sha == local_build_sha and local_ver == remote_ver:
-            msg = f"Сэр, JARVIS актуален. Версия {local_ver}."
-            if not silent: _say(msg)
-            else: print(f"[UPDATE] {msg}")
-            return msg
-
-        msg = f"Сэр, доступна новая версия JARVIS: {remote_ver}."
-        _say(msg)
-        build_url = manifest.get("build_url") or _default_build_url(
-            remote_ver, manifest.get("build_asset"))
-        threading.Thread(
-            target=_do_download_and_apply_frozen,
-            args=(remote_ver, remote_build_sha, build_url),
-            daemon=True, name="JarvisFrozenUpdate"
-        ).start()
-        return msg
-
-    # ═══════════════════════════════ DEV ══════════════════════════════════
     remote_files = manifest.get("files", {})
     changed = _find_changed(remote_files)
 
@@ -770,22 +514,12 @@ def answer_update_history_query(query_version: str | None, latest: bool = False)
 
 
 # ── Утилита для разработчика: генерация version.json ─────────────────────────
-def generate_version_json(version: str, project_dir: Path | None = None,
-                          build_zip: Path | None = None,
-                          build_url: str | None = None):
+def generate_version_json(version: str, project_dir: Path | None = None):
     """
-    Генерирует version.json с SHA-256 хешами.
-
-    - Секция "files" (поштучные хеши .py) — как и раньше, для dev-режима.
-    - Если передан build_zip — дополнительно добавляет "build_sha256"
-      (хеш ВСЕГО архива) и "build_asset" (имя файла архива) для
-      frozen-режима. Если архив лежит не по стандартному пути на GitHub
-      Releases (https://github.com/USER/REPO/releases/download/vX.Y.Z/имя),
-      укажи build_url явно.
+    Генерирует version.json с SHA-256 хешами всех .py-файлов проекта.
 
     Запустить перед каждым релизом:
-        python updater.py --generate 1.0.5
-        python updater.py --generate 1.0.5 --build-zip dist\\JARVIS-1.0.5-win64.zip
+        python updater.py --generate 1.0.9
     """
     base = project_dir or Path(".").resolve()
     files = {}
@@ -800,27 +534,12 @@ def generate_version_json(version: str, project_dir: Path | None = None,
     payload = {"version": version, "files": files,
                "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
 
-    if build_zip is not None:
-        build_zip = Path(build_zip)
-        if not build_zip.exists():
-            print(f"[!] --build-zip указан, но файл не найден: {build_zip}")
-        else:
-            zip_sha = _sha256(build_zip)
-            payload["build_sha256"] = zip_sha
-            payload["build_asset"]  = build_zip.name
-            if build_url:
-                payload["build_url"] = build_url
-            print(f"  + build: {build_zip.name}  sha256={zip_sha}")
-
     out = base / "version.json"
     out.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
     print(f"\n✓ version.json → {out}  ({len(files)} файлов, версия {version})")
-    if build_zip is not None and build_zip.exists():
-        print(f"  Не забудь выложить {build_zip.name} в GitHub Releases под тегом v{version}"
-              f" (или укажи свой --build-url, если хранишь архив в другом месте).")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -828,16 +547,10 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="JARVIS Updater")
     p.add_argument("--generate", metavar="VER", help="Generate version.json, e.g. 1.0.1")
-    p.add_argument("--build-zip", metavar="PATH",
-                   help="Path to the built distribution zip (adds build_sha256 for frozen-mode updates)")
-    p.add_argument("--build-url", metavar="URL",
-                   help="Explicit download URL for the build zip (default: GitHub Releases pattern)")
     p.add_argument("--check",    action="store_true", help="Check for updates now")
     a = p.parse_args()
     if a.generate:
-        generate_version_json(a.generate, Path("."),
-                              build_zip=Path(a.build_zip) if a.build_zip else None,
-                              build_url=a.build_url)
+        generate_version_json(a.generate, Path("."))
     elif a.check:
         print(check_and_update(silent=False))
     else:

@@ -1,14 +1,11 @@
 {
-  "version": "1.0.7",
+  "version": "1.0.8",
   "files": {
-    "JARVIS-1.0.7-win64.zip": "b8956be13fcc3910620761dd075639f4360a9911f006db2f4369dc950525a168",
     "jarvis_analytics.py": "211c5547bfd2f65917c87ca6aa3a45fac514f8693f4ac56454198308109239b9",
     "jarvis_features.py": "ac0a491c230e87deb70ab76fbd2057e065438d1963abd62285f6ab86f775af46",
     "jarvis_ui.py": "a30ea7cca8005f28ca7cda1175a486b231e1737e98748e4c678ea3a0d63a2be3",
     "jarvis_vip.py": "6292ae0b4cf125c43795e85eaa7371b013b0401d464eb0e40f733aa6ada0a70d",
-    "main_app.py": "7e713ccd6fe18db11769eafdbee0e501a94962ff237099a9e4df91b102078c0d"
+    "main_app.py": "5bf9f8ba0dfdb7cb08c8f6b1ecf2b2ea428243857fb0c88c90ac5036285e9018"
   },
-  "updated": "2026-08-06 17:31:43",
-  "build_sha256": "b8956be13fcc3910620761dd075639f4360a9911f006db2f4369dc950525a168",
-  "build_asset": "JARVIS-1.0.7-win64.zip"
+  "updated": "2026-08-07 14:15:44"
 }
